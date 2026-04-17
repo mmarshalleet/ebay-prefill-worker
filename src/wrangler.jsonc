@@ -1,1 +1,10 @@
-
+{
+  "name": "ebay-prefill-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-17",
+  "nodejs_compat": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  }
+}
