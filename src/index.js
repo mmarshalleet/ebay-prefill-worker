@@ -1,16 +1,3 @@
-import * as XLSX from "xlsx";
-
-const TEMPLATE_PATH = "/templates/ebay_prefill_customized_inventory.xlsx";
-const SHEET_NAME = "eBay-prefill-listing-template";
-
-const REQUIRED_HEADERS = [
-  "Custom Label (SKU)",
-  "Item Photo URL",
-  "Title",
-  "Category",
-  "Aspects"
-];
-
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -21,8 +8,15 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function normalizeText(value) {
-  return String(value ?? "").trim();
+function textResponse(text, filename = "output.csv", status = 200) {
+  return new Response(text, {
+    status,
+    headers: {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": `attachment; filename="${filename}"`,
+      "cache-control": "no-store"
+    }
+  });
 }
 
 function cleanText(value) {
@@ -31,326 +25,508 @@ function cleanText(value) {
     .trim();
 }
 
+function normalizeCondition(condition) {
+  const c = cleanText(condition).toLowerCase();
+
+  if (["new", "brand new", "factory sealed", "sealed"].includes(c)) return "New";
+  if (["new open box", "open box", "new – open box", "new — open box", "new - open box", "nos"].includes(c)) return "New Open Box";
+  if (["used", "tested used"].includes(c)) return "Used";
+  if (["for parts", "parts only", "not working", "for parts or not working"].includes(c)) {
+    return "For parts or not working";
+  }
+
+  return cleanText(condition);
+}
+
 function truncateTitle(title, maxLength = 80) {
   const cleaned = cleanText(title);
   if (cleaned.length <= maxLength) return cleaned;
   return cleaned.slice(0, maxLength).replace(/\s+\S*$/, "").trim();
 }
 
-function escapeAspectValue(value) {
-  return String(value ?? "")
-    .replace(/\|/g, "/")
-    .replace(/=/g, "-")
+function uniqueWords(values) {
+  const out = [];
+  const seen = new Set();
+
+  for (const v of values) {
+    const s = cleanText(v);
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(s);
+    }
+  }
+
+  return out;
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function roundEbayPrice(value) {
+  if (!Number.isFinite(value) || value <= 0) return null;
+
+  let rounded;
+  if (value >= 1000) rounded = Math.round(value / 25) * 25 - 0.01;
+  else if (value >= 250) rounded = Math.round(value / 10) * 10 - 0.01;
+  else if (value >= 100) rounded = Math.round(value / 5) * 5 - 0.01;
+  else rounded = Math.round(value) - 0.01;
+
+  return Number(rounded.toFixed(2));
+}
+
+function escapeCsv(value) {
+  const s = String(value ?? "");
+  if (/[",\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function parseCsvLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+
+    if (ch === '"' && inQuotes && next === '"') {
+      current += '"';
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (ch === "," && !inQuotes) {
+      result.push(current);
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  result.push(current);
+  return result;
+}
+
+function parseCsv(csvText) {
+  const lines = String(csvText ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter(line => line.length > 0);
+
+  if (!lines.length) return [];
+
+  const headers = parseCsvLine(lines[0]).map(h => cleanText(h));
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = parseCsvLine(lines[i]);
+    const row = {};
+
+    for (let j = 0; j < headers.length; j++) {
+      row[headers[j]] = values[j] ?? "";
+    }
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function toCsv(rows) {
+  if (!rows.length) return "";
+
+  const headers = [...new Set(rows.flatMap(r => Object.keys(r)))];
+  const lines = [
+    headers.map(escapeCsv).join(","),
+    ...rows.map(row => headers.map(h => escapeCsv(row[h] ?? "")).join(","))
+  ];
+
+  return lines.join("\n");
+}
+
+function getField(row, candidates) {
+  for (const key of candidates) {
+    if (row[key] !== undefined && row[key] !== "") return row[key];
+  }
+  return "";
+}
+
+function parsePrice(value) {
+  const n = Number(String(value ?? "").replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function splitPhotoUrls(value) {
+  const s = cleanText(value);
+  if (!s) return [];
+  return s.split("|").map(v => cleanText(v)).filter(Boolean);
+}
+
+function titleWords(title) {
+  return cleanText(title)
+    .split(/\s+/)
+    .map(v => v.replace(/[^\w.+/-]/g, ""))
+    .filter(Boolean);
+}
+
+function looksLikeMpn(token) {
+  const s = cleanText(token);
+  if (!s) return false;
+  if (s.length < 4) return false;
+  if (!/[A-Za-z]/.test(s) || !/\d/.test(s)) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(s);
+}
+
+function extractMpn(title) {
+  const words = titleWords(title);
+  const blacklist = new Set([
+    "NEW", "USED", "BOX", "OPEN", "WITH", "AND", "FOR", "PLC", "HMI", "VFD",
+    "SENSOR", "PROXIMITY", "SWITCH", "MODULE", "INPUT", "OUTPUT", "DRIVE"
+  ]);
+
+  for (const word of words) {
+    const up = word.toUpperCase();
+    if (blacklist.has(up)) continue;
+    if (looksLikeMpn(word)) return word;
+  }
+
+  return "";
+}
+
+function extractBrand(title) {
+  const t = cleanText(title);
+  const knownBrands = [
+    "Allen-Bradley",
+    "Banner Engineering",
+    "Balluff",
+    "Wiegmann",
+    "Festo",
+    "HTM",
+    "Sealite",
+    "New Klay Instrument",
+    "Smart",
+    "Siemens",
+    "Omron",
+    "Keyence",
+    "Mitsubishi",
+    "Schneider",
+    "Pro-face",
+    "Proface",
+    "Marel",
+    "Secomea"
+  ];
+
+  for (const brand of knownBrands) {
+    if (t.toLowerCase().includes(brand.toLowerCase())) return brand;
+  }
+
+  return titleWords(t).slice(0, 2).join(" ");
+}
+
+function extractModel(title, brand, mpn) {
+  const t = cleanText(title);
+  let model = t;
+
+  if (brand) {
+    const reBrand = new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    model = model.replace(reBrand, "").trim();
+  }
+
+  if (mpn) {
+    const reMpn = new RegExp(mpn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    model = model.replace(reMpn, "").trim();
+  }
+
+  model = model
+    .replace(/\b(new|used|open box|new open box|factory sealed|sealed)\b/ig, "")
+    .replace(/\s+/g, " ")
     .trim();
+
+  return model.split(" ").slice(0, 4).join(" ");
 }
 
-function normalizePhotoUrls(photoUrls) {
-  if (!Array.isArray(photoUrls)) return "";
-  return photoUrls
-    .map((v) => String(v || "").trim())
-    .filter(Boolean)
-    .join("|");
+function inferType(title, categoryId) {
+  const t = cleanText(title).toLowerCase();
+
+  if (["181708"].includes(String(categoryId))) return "PLC Processor";
+  if (["65459"].includes(String(categoryId))) return "Proximity Sensor";
+  if (t.includes("panelview") || t.includes("hmi") || t.includes("operator interface")) return "HMI";
+  if (t.includes("powerflex") || t.includes("vfd") || t.includes("drive")) return "Variable Frequency Drive";
+  if (t.includes("plc") || t.includes("compactlogix") || t.includes("controllogix") || t.includes("micrologix")) return "PLC Processor";
+  if (t.includes("sensor")) return "Sensor";
+  if (t.includes("module")) return "Module";
+  if (t.includes("conduit")) return "Conduit Fitting";
+
+  return "Industrial Automation Component";
 }
 
-function normalizeCondition(condition) {
-  const c = String(condition || "").toLowerCase().trim();
+function mapCategoryName(categoryId, title = "") {
+  const id = String(categoryId || "");
+  const t = cleanText(title).toLowerCase();
 
-  if (["new", "factory sealed", "sealed"].includes(c)) return "New";
-  if (["new open box", "open box", "nos"].includes(c)) return "New Open Box";
-  if (["used", "tested used"].includes(c)) return "Used";
-  if (["for parts", "parts only", "not working"].includes(c)) {
-    return "For parts or not working";
-  }
-
-  return cleanText(condition || "");
-}
-
-function buildCategory(item) {
-  const type = String(item.type || "").toLowerCase();
-  const model = String(item.model || "").toLowerCase();
-  const title = String(item.title || "").toLowerCase();
-
-  if (
-    type.includes("drive") ||
-    type.includes("vfd") ||
-    model.includes("powerflex") ||
-    title.includes("drive")
-  ) {
-    return "Variable Frequency Drives";
-  }
-
-  if (
-    type.includes("hmi") ||
-    type.includes("panelview") ||
-    model.includes("panelview") ||
-    title.includes("hmi")
-  ) {
-    return "HMI & Open Interface Panels";
-  }
-
-  if (
-    type.includes("plc") ||
-    type.includes("controller") ||
-    title.includes("compactlogix") ||
-    title.includes("controllogix") ||
-    title.includes("micrologix")
-  ) {
-    return "PLC Processors";
-  }
-
-  if (type.includes("sensor") || title.includes("sensor")) {
-    return "Other Sensors";
-  }
-
-  return cleanText(item.category || "");
-}
-
-function buildAspects(item) {
-  return {
-    Brand: item.brand,
-    MPN: item.mpn,
-    Model: item.model,
-    Type: item.type,
-    Condition: normalizeCondition(item.condition),
-    Voltage: item.voltage,
-    Phase: item.phase,
-    InputVoltage: item.inputVoltage,
-    OutputVoltage: item.outputVoltage
+  const categoryMap = {
+    "65459": "Proximity Sensors",
+    "181708": "PLC Processors",
+    "42894": "General Purpose Industrial Control",
+    "26261": "Other Business & Industrial",
+    "184027": "Hydraulic Valves",
+    "117490": "Conduit Fittings"
   };
+
+  if (categoryMap[id]) return categoryMap[id];
+  if (t.includes("sensor")) return "Other Sensors";
+  if (t.includes("plc")) return "PLC Processors";
+  if (t.includes("drive") || t.includes("vfd")) return "Variable Frequency Drives";
+  if (t.includes("panelview") || t.includes("hmi")) return "HMI & Open Interface Panels";
+
+  return "Other Business & Industrial";
 }
 
-function normalizeAspects(aspects) {
-  if (!aspects || typeof aspects !== "object") return "";
-
-  return Object.entries(aspects)
-    .filter(([k, v]) => normalizeText(k) && normalizeText(v))
-    .map(([k, v]) => `${normalizeText(k)}=${escapeAspectValue(v)}`)
-    .join("|");
-}
-
-function buildTitle(item) {
+function optimizeTitle(item) {
   const condition = normalizeCondition(item.condition);
 
-  const parts = [
+  const parts = uniqueWords([
     item.brand,
     item.model,
     item.mpn,
     item.type,
-    ...(Array.isArray(item.keywords) ? item.keywords : []),
+    ...item.specs,
     condition
-  ]
-    .map((v) => cleanText(v))
-    .filter(Boolean);
+  ]);
 
   return truncateTitle(parts.join(" "));
 }
 
-function validateRow(item, index) {
-  const errors = [];
+function extractSpecs(title) {
+  const specs = [];
+  const tokens = titleWords(title);
 
-  if (!cleanText(item.sku)) {
-    errors.push(`Row ${index + 1}: missing sku`);
+  for (const token of tokens) {
+    const up = token.toUpperCase();
+
+    if (/^\d+V$/.test(up)) specs.push(token);
+    else if (/^\d+HP$/.test(up)) specs.push(token);
+    else if (/^\d+PHASE$/.test(up)) specs.push(token);
+    else if (/^\d+[- ]?PHASE$/.test(up.replace(/\s+/g, ""))) specs.push(token);
+    else if (/^\d+MM$/.test(up)) specs.push(token);
+    else if (/^\d+IN$/.test(up)) specs.push(token);
+    else if (up === "TOUCH" || up === "TOUCHSCREEN") specs.push(token);
   }
 
-  if (!Array.isArray(item.photoUrls) || item.photoUrls.length === 0) {
-    errors.push(`Row ${index + 1}: missing photoUrls`);
-  }
-
-  const hasTitleInputs =
-    cleanText(item.title) ||
-    cleanText(item.brand) ||
-    cleanText(item.model) ||
-    cleanText(item.mpn) ||
-    cleanText(item.type);
-
-  if (!hasTitleInputs) {
-    errors.push(`Row ${index + 1}: missing title and title-building fields`);
-  }
-
-  return errors;
+  return uniqueWords(specs);
 }
 
-function makeRow(item) {
-  const condition = normalizeCondition(item.condition);
-  const builtAspects = item.aspects && typeof item.aspects === "object"
-    ? item.aspects
-    : buildAspects({ ...item, condition });
+function detectIssues(item, allSkus) {
+  const issues = [];
+
+  if (!item.sku) issues.push("MISSING_SKU");
+  if (item.sku && allSkus.get(item.sku) > 1) issues.push("DUPLICATE_SKU");
+  if (!item.title) issues.push("MISSING_TITLE");
+  if (!item.currentPrice || item.currentPrice <= 0) issues.push("INVALID_PRICE");
+  if (!item.photoUrls.length) issues.push("NO_PHOTOS");
+  if (!item.mpn) issues.push("MPN_MISSING");
+  if (item.mpn && !item.title.toLowerCase().includes(item.mpn.toLowerCase())) {
+    issues.push("MPN_NOT_IN_TITLE");
+  }
+  if (!item.categoryId) issues.push("MISSING_CATEGORY_ID");
+  if (item.optimizedTitle.length < 20) issues.push("WEAK_TITLE");
+  if (item.optimizedTitle === item.title) issues.push("TITLE_UNCHANGED");
+
+  return issues;
+}
+
+function calculateSuggestedPrice(item, compGroup) {
+  const compPrices = compGroup
+    .map(x => x.currentPrice)
+    .filter(v => Number.isFinite(v) && v > 0);
+
+  if (!compPrices.length) return item.currentPrice;
+
+  const med = median(compPrices);
+  const condition = normalizeCondition(item.condition).toLowerCase();
+
+  let multiplier = 1.0;
+  if (condition === "new") multiplier = 1.08;
+  else if (condition === "new open box") multiplier = 1.02;
+  else if (condition === "used") multiplier = 0.9;
+  else if (condition.includes("parts")) multiplier = 0.6;
+
+  const suggested = roundEbayPrice(med * multiplier);
+  if (!suggested) return item.currentPrice;
+
+  if (item.currentPrice && suggested < item.currentPrice * 0.7) {
+    return item.currentPrice;
+  }
+
+  return suggested;
+}
+
+function buildCompKey(item) {
+  if (item.mpn) return `mpn:${item.mpn.toLowerCase()}`;
+  return `title:${cleanText(item.title).split(" ").slice(0, 4).join(" ").toLowerCase()}`;
+}
+
+function mapEbayRow(row) {
+  const title = cleanText(getField(row, ["Title"]));
+  const sku = cleanText(getField(row, ["Custom label (SKU)", "Custom label", "SKU"]));
+  const currentPrice = parsePrice(getField(row, ["Current price", "Start price"]));
+  const startPrice = parsePrice(getField(row, ["Start price"]));
+  const condition = cleanText(getField(row, ["Condition"]));
+  const categoryId = cleanText(getField(row, ["eBay category 1", "eBay category", "eBay category ID"]));
+  const photoUrls = splitPhotoUrls(getField(row, ["Item photo URL", "Item photo urls", "Photo URL"]));
+  const brand = extractBrand(title);
+  const mpn = extractMpn(title);
+  const model = extractModel(title, brand, mpn);
+  const type = inferType(title, categoryId);
+  const specs = extractSpecs(title);
 
   return {
-    "Custom Label (SKU)": cleanText(item.sku),
-    "Item Photo URL": normalizePhotoUrls(item.photoUrls),
-    "Title": truncateTitle(item.title || buildTitle({ ...item, condition })),
-    "Category": cleanText(item.category || buildCategory(item)),
-    "Aspects": normalizeAspects(builtAspects)
+    raw: row,
+    sku,
+    title,
+    currentPrice,
+    startPrice,
+    condition,
+    categoryId,
+    photoUrls,
+    brand,
+    mpn,
+    model,
+    type,
+    specs
   };
 }
 
-function findHeaderRowAndColumns(ws) {
-  const range = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
-
-  for (let r = range.s.r; r <= range.e.r; r++) {
-    const colMap = {};
-
-    for (let c = range.s.c; c <= range.e.c; c++) {
-      const addr = XLSX.utils.encode_cell({ r, c });
-      const cell = ws[addr];
-      const value = normalizeText(cell?.v);
-
-      if (REQUIRED_HEADERS.includes(value)) {
-        colMap[value] = c;
-      }
-    }
-
-    const foundAll = REQUIRED_HEADERS.every((header) => colMap[header] !== undefined);
-    if (foundAll) {
-      return { headerRow: r, colMap };
-    }
-  }
-
-  throw new Error(`Could not find the required header row on sheet "${SHEET_NAME}".`);
-}
-
-function clearDataRowsBelowHeader(ws, headerRow, colMap) {
-  const range = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
-  const minCol = Math.min(...Object.values(colMap));
-  const maxCol = Math.max(...Object.values(colMap));
-
-  for (let r = headerRow + 1; r <= range.e.r; r++) {
-    for (let c = minCol; c <= maxCol; c++) {
-      const addr = XLSX.utils.encode_cell({ r, c });
-      delete ws[addr];
-    }
-  }
-
-  ws["!ref"] = XLSX.utils.encode_range({
-    s: { r: range.s.r, c: range.s.c },
-    e: { r: headerRow, c: range.e.c }
-  });
-}
-
-function writeRows(ws, headerRow, colMap, rows) {
-  let targetRow = headerRow + 1;
-
-  for (const row of rows) {
-    for (const header of REQUIRED_HEADERS) {
-      const c = colMap[header];
-      const addr = XLSX.utils.encode_cell({ r: targetRow, c });
-      ws[addr] = {
-        t: "s",
-        v: row[header] ?? ""
-      };
-    }
-    targetRow++;
-  }
-
-  const currentRange = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
-  const maxWrittenRow = Math.max(currentRange.e.r, targetRow - 1);
-  const maxWrittenCol = Math.max(currentRange.e.c, ...Object.values(colMap));
-
-  ws["!ref"] = XLSX.utils.encode_range({
-    s: { r: currentRange.s.r, c: currentRange.s.c },
-    e: { r: maxWrittenRow, c: maxWrittenCol }
-  });
-}
-
-async function loadTemplateFromAssets(env) {
-  const assetUrl = new URL(`https://internal${TEMPLATE_PATH}`);
-  const response = await env.ASSETS.fetch(assetUrl);
-
-  if (!response.ok) {
-    throw new Error(`Template asset not found at ${TEMPLATE_PATH}`);
-  }
-
-  return await response.arrayBuffer();
+function buildAuditRows(items) {
+  return items.map(item => ({
+    SKU: item.sku,
+    CurrentTitle: item.title,
+    OptimizedTitle: item.optimizedTitle,
+    CurrentPrice: item.currentPrice ?? "",
+    SuggestedPrice: item.suggestedPrice ?? "",
+    PriceDelta: Number.isFinite(item.suggestedPrice) && Number.isFinite(item.currentPrice)
+      ? Number((item.suggestedPrice - item.currentPrice).toFixed(2))
+      : "",
+    Condition: item.normalizedCondition,
+    CategoryID: item.categoryId,
+    CategoryName: item.categoryName,
+    Brand: item.brand,
+    MPN: item.mpn,
+    Model: item.model,
+    Type: item.type,
+    PhotoCount: item.photoUrls.length,
+    Issues: item.issues.join("|")
+  }));
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request) {
     if (request.method === "GET") {
       return jsonResponse({
         ok: true,
-        message: "POST JSON with { rows: [...] } or { preview: true, rows: [...] }"
+        message: "POST raw eBay CSV export. Optional query: ?preview=true"
       });
     }
 
     if (request.method !== "POST") {
-      return jsonResponse(
-        { ok: false, error: "Use POST with JSON body: { rows: [...] }" },
-        405
-      );
+      return jsonResponse({ ok: false, error: "Use POST." }, 405);
     }
 
     try {
-      const body = await request.json();
-      const inputRows = Array.isArray(body?.rows) ? body.rows : [];
+      const url = new URL(request.url);
+      const preview = url.searchParams.get("preview") === "true";
+      const output = url.searchParams.get("output") || "csv";
 
-      if (!inputRows.length) {
-        return jsonResponse({ ok: false, error: "No rows provided." }, 400);
+      const csvText = await request.text();
+      if (!csvText || !csvText.trim()) {
+        return jsonResponse({ ok: false, error: "Empty CSV body." }, 400);
       }
 
-      const validationErrors = inputRows.flatMap((row, i) => validateRow(row, i));
-      if (validationErrors.length) {
-        return jsonResponse(
-          {
-            ok: false,
-            error: "Validation failed.",
-            details: validationErrors
-          },
-          400
+      const rows = parseCsv(csvText);
+      if (!rows.length) {
+        return jsonResponse({ ok: false, error: "No rows parsed from CSV." }, 400);
+      }
+
+      const mapped = rows.map(mapEbayRow);
+
+      const skuCounts = new Map();
+      for (const item of mapped) {
+        if (!item.sku) continue;
+        skuCounts.set(item.sku, (skuCounts.get(item.sku) || 0) + 1);
+      }
+
+      const compGroups = new Map();
+      for (const item of mapped) {
+        const key = buildCompKey(item);
+        if (!compGroups.has(key)) compGroups.set(key, []);
+        compGroups.get(key).push(item);
+      }
+
+      const finalItems = mapped.map(item => {
+        const normalizedCondition = normalizeCondition(item.condition);
+        const categoryName = mapCategoryName(item.categoryId, item.title);
+        const optimizedTitle = optimizeTitle({
+          ...item,
+          condition: normalizedCondition
+        });
+        const suggestedPrice = calculateSuggestedPrice(
+          { ...item, condition: normalizedCondition },
+          compGroups.get(buildCompKey(item)) || []
         );
-      }
 
-      const transformedRows = inputRows.map(makeRow);
+        const enriched = {
+          ...item,
+          normalizedCondition,
+          categoryName,
+          optimizedTitle,
+          suggestedPrice
+        };
 
-      if (body?.preview === true) {
+        enriched.issues = detectIssues(enriched, skuCounts);
+        return enriched;
+      });
+
+      const auditRows = buildAuditRows(finalItems);
+
+      if (preview) {
         return jsonResponse({
           ok: true,
-          previewRows: transformedRows
+          summary: {
+            totalRows: finalItems.length,
+            duplicateSkus: finalItems.filter(x => x.issues.includes("DUPLICATE_SKU")).length,
+            missingSku: finalItems.filter(x => x.issues.includes("MISSING_SKU")).length,
+            missingMpn: finalItems.filter(x => x.issues.includes("MPN_MISSING")).length,
+            noPhotos: finalItems.filter(x => x.issues.includes("NO_PHOTOS")).length,
+            changedTitles: finalItems.filter(x => x.optimizedTitle !== x.title).length
+          },
+          rows: auditRows.slice(0, 100)
         });
       }
 
-      const templateArrayBuffer = await loadTemplateFromAssets(env);
-
-      const workbook = XLSX.read(templateArrayBuffer, {
-        type: "array",
-        cellStyles: true,
-        cellFormula: true,
-        cellNF: true,
-        cellDates: true
-      });
-
-      const ws = workbook.Sheets[SHEET_NAME];
-
-      if (!ws) {
-        return jsonResponse(
-          {
-            ok: false,
-            error: `Sheet "${SHEET_NAME}" not found in template.`
-          },
-          500
-        );
+      if (output === "json") {
+        return jsonResponse({
+          ok: true,
+          rows: auditRows
+        });
       }
 
-      const { headerRow, colMap } = findHeaderRowAndColumns(ws);
-
-      clearDataRowsBelowHeader(ws, headerRow, colMap);
-      writeRows(ws, headerRow, colMap, transformedRows);
-
-      const output = XLSX.write(workbook, {
-        type: "array",
-        bookType: "xlsx",
-        compression: true
-      });
-
-      return new Response(output, {
-        status: 200,
-        headers: {
-          "content-type":
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          "content-disposition": 'attachment; filename="ebay_prefill_filled.xlsx"',
-          "cache-control": "no-store"
-        }
-      });
+      const outCsv = toCsv(auditRows);
+      return textResponse(outCsv, "ebay_active_listing_audit.csv");
     } catch (error) {
       return jsonResponse(
         {
