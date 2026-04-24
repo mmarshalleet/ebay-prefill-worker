@@ -404,7 +404,7 @@ export default {
       return jsonResponse(
         {
           ok: false,
-          error: error?.message || "Worker failed."
+          error: error?.message || "failed."
         },
         500
       );
