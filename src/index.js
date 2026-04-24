@@ -8,9 +8,9 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function textResponse(text, filename = "output.csv", status = 200) {
+function csvResponse(text, filename = "eBay-edit-price-quantity-with-cost.csv") {
   return new Response(text, {
-    status,
+    status: 200,
     headers: {
       "content-type": "text/csv; charset=utf-8",
       "content-disposition": `attachment; filename="${filename}"`,
@@ -20,71 +20,18 @@ function textResponse(text, filename = "output.csv", status = 200) {
 }
 
 function cleanText(value) {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
-function normalizeCondition(condition) {
-  const c = cleanText(condition).toLowerCase();
-
-  if (["new", "brand new", "factory sealed", "sealed"].includes(c)) return "New";
-  if (["new open box", "open box", "new – open box", "new — open box", "new - open box", "nos"].includes(c)) return "New Open Box";
-  if (["used", "tested used"].includes(c)) return "Used";
-  if (["for parts", "parts only", "not working", "for parts or not working"].includes(c)) {
-    return "For parts or not working";
-  }
-
-  return cleanText(condition);
-}
-
-function truncateTitle(title, maxLength = 80) {
-  const cleaned = cleanText(title);
-  if (cleaned.length <= maxLength) return cleaned;
-  return cleaned.slice(0, maxLength).replace(/\s+\S*$/, "").trim();
-}
-
-function uniqueWords(values) {
-  const out = [];
-  const seen = new Set();
-
-  for (const v of values) {
-    const s = cleanText(v);
-    if (!s) continue;
-    const key = s.toLowerCase();
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(s);
-    }
-  }
-
-  return out;
-}
-
-function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-function roundEbayPrice(value) {
-  if (!Number.isFinite(value) || value <= 0) return null;
-
-  let rounded;
-  if (value >= 1000) rounded = Math.round(value / 25) * 25 - 0.01;
-  else if (value >= 250) rounded = Math.round(value / 10) * 10 - 0.01;
-  else if (value >= 100) rounded = Math.round(value / 5) * 5 - 0.01;
-  else rounded = Math.round(value) - 0.01;
-
-  return Number(rounded.toFixed(2));
+function parsePrice(value) {
+  const cleaned = String(value ?? "").replace(/[^0-9.-]/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : "";
 }
 
 function escapeCsv(value) {
   const s = String(value ?? "");
-  if (/[",\n]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
@@ -100,21 +47,14 @@ function parseCsvLine(line) {
     if (ch === '"' && inQuotes && next === '"') {
       current += '"';
       i++;
-      continue;
-    }
-
-    if (ch === '"') {
+    } else if (ch === '"') {
       inQuotes = !inQuotes;
-      continue;
-    }
-
-    if (ch === "," && !inQuotes) {
+    } else if (ch === "," && !inQuotes) {
       result.push(current);
       current = "";
-      continue;
+    } else {
+      current += ch;
     }
-
-    current += ch;
   }
 
   result.push(current);
@@ -126,312 +66,246 @@ function parseCsv(csvText) {
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
     .split("\n")
-    .filter(line => line.length > 0);
+    .filter(line => line.trim());
 
   if (!lines.length) return [];
 
-  const headers = parseCsvLine(lines[0]).map(h => cleanText(h));
-  const rows = [];
+  const headers = parseCsvLine(lines[0]).map(cleanText);
 
-  for (let i = 1; i < lines.length; i++) {
-    const values = parseCsvLine(lines[i]);
+  return lines.slice(1).map(line => {
+    const values = parseCsvLine(line);
     const row = {};
-
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = values[j] ?? "";
-    }
-
-    rows.push(row);
-  }
-
-  return rows;
+    headers.forEach((header, i) => {
+      row[header] = values[i] ?? "";
+    });
+    return row;
+  });
 }
 
-function toCsv(rows) {
-  if (!rows.length) return "";
+function getField(row, names) {
+  for (const name of names) {
+    if (row[name] !== undefined && cleanText(row[name]) !== "") return row[name];
+  }
+  return "";
+}
 
-  const headers = [...new Set(rows.flatMap(r => Object.keys(r)))];
-  const lines = [
+function normalizeCondition(condition) {
+  const c = cleanText(condition).toLowerCase();
+
+  if (["new", "brand new", "factory sealed", "sealed"].includes(c)) return "New";
+
+  if (
+    [
+      "new open box",
+      "open box",
+      "new - open box",
+      "new – open box",
+      "new — open box",
+      "nos"
+    ].includes(c)
+  ) {
+    return "New Open Box";
+  }
+
+  if (["used", "tested used"].includes(c)) return "Used";
+
+  if (
+    ["for parts", "parts only", "not working", "for parts or not working"].includes(c)
+  ) {
+    return "For parts or not working";
+  }
+
+  return cleanText(condition);
+}
+
+function roundEbayPrice(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+
+  let rounded;
+
+  if (n >= 1000) rounded = Math.round(n / 25) * 25 - 0.01;
+  else if (n >= 250) rounded = Math.round(n / 10) * 10 - 0.01;
+  else if (n >= 100) rounded = Math.round(n / 5) * 5 - 0.01;
+  else rounded = Math.round(n) - 0.01;
+
+  return Number(rounded.toFixed(2));
+}
+
+function suggestPrice(currentPrice, cost, condition) {
+  const current = Number(currentPrice);
+  const itemCost = Number(cost);
+  const normalized = normalizeCondition(condition).toLowerCase();
+
+  if (!Number.isFinite(current) || current <= 0) return "";
+
+  let multiplier = 1;
+
+  if (normalized === "new") multiplier = 1.08;
+  else if (normalized === "new open box") multiplier = 1.02;
+  else if (normalized === "used") multiplier = 0.92;
+  else if (normalized.includes("parts")) multiplier = 0.65;
+
+  let proposed = current * multiplier;
+
+  // Guardrail: never auto-drop more than 20%
+  const maxDropPrice = current * 0.8;
+  if (proposed < maxDropPrice) proposed = maxDropPrice;
+
+  // Guardrail: if cost exists, keep at least 35% above cost
+  if (Number.isFinite(itemCost) && itemCost > 0) {
+    const minPrice = itemCost * 1.35;
+    if (proposed < minPrice) proposed = minPrice;
+  }
+
+  return roundEbayPrice(proposed);
+}
+
+function toCsv(rows, headers) {
+  return [
     headers.map(escapeCsv).join(","),
     ...rows.map(row => headers.map(h => escapeCsv(row[h] ?? "")).join(","))
-  ];
-
-  return lines.join("\n");
+  ].join("\n");
 }
 
-function getField(row, candidates) {
-  for (const key of candidates) {
-    if (row[key] !== undefined && row[key] !== "") return row[key];
-  }
-  return "";
-}
+function mapEbayRow(row) {
+  const itemNumber = cleanText(
+    getField(row, [
+      "Item number",
+      "Item Number",
+      "Item ID",
+      "Item Id",
+      "ItemID"
+    ])
+  );
 
-function parsePrice(value) {
-  const n = Number(String(value ?? "").replace(/[^0-9.-]/g, ""));
-  return Number.isFinite(n) ? n : null;
-}
+  const sku = cleanText(
+    getField(row, [
+      "Custom label (SKU)",
+      "Custom Label (SKU)",
+      "Custom label",
+      "Custom Label",
+      "SKU"
+    ])
+  );
 
-function splitPhotoUrls(value) {
-  const s = cleanText(value);
-  if (!s) return [];
-  return s.split("|").map(v => cleanText(v)).filter(Boolean);
-}
+  const title = cleanText(
+    getField(row, [
+      "Title",
+      "Item title",
+      "Listing title"
+    ])
+  );
 
-function titleWords(title) {
-  return cleanText(title)
-    .split(/\s+/)
-    .map(v => v.replace(/[^\w.+/-]/g, ""))
-    .filter(Boolean);
-}
+  const currentPrice = parsePrice(
+    getField(row, [
+      "Current price",
+      "Current Price",
+      "Start price",
+      "Start Price",
+      "Price",
+      "Buy It Now price",
+      "Buy It Now Price"
+    ])
+  );
 
-function looksLikeMpn(token) {
-  const s = cleanText(token);
-  if (!s) return false;
-  if (s.length < 4) return false;
-  if (!/[A-Za-z]/.test(s) || !/\d/.test(s)) return false;
-  return /^[A-Za-z0-9._/-]+$/.test(s);
-}
+  const quantity = cleanText(
+    getField(row, [
+      "Available quantity",
+      "Available Quantity",
+      "Quantity",
+      "Qty",
+      "Available"
+    ])
+  );
 
-function extractMpn(title) {
-  const words = titleWords(title);
-  const blacklist = new Set([
-    "NEW", "USED", "BOX", "OPEN", "WITH", "AND", "FOR", "PLC", "HMI", "VFD",
-    "SENSOR", "PROXIMITY", "SWITCH", "MODULE", "INPUT", "OUTPUT", "DRIVE"
-  ]);
+  const condition = cleanText(
+    getField(row, [
+      "Condition",
+      "Item condition"
+    ])
+  );
 
-  for (const word of words) {
-    const up = word.toUpperCase();
-    if (blacklist.has(up)) continue;
-    if (looksLikeMpn(word)) return word;
-  }
+  const cost = parsePrice(
+    getField(row, [
+      "My cost",
+      "My Cost",
+      "Cost",
+      "Item cost",
+      "Item Cost",
+      "Product cost",
+      "Product Cost"
+    ])
+  );
 
-  return "";
-}
-
-function extractBrand(title) {
-  const t = cleanText(title);
-  const knownBrands = [
-    "Allen-Bradley",
-    "Banner Engineering",
-    "Balluff",
-    "Wiegmann",
-    "Festo",
-    "HTM",
-    "Sealite",
-    "New Klay Instrument",
-    "Smart",
-    "Siemens",
-    "Omron",
-    "Keyence",
-    "Mitsubishi",
-    "Schneider",
-    "Pro-face",
-    "Proface",
-    "Marel",
-    "Secomea"
-  ];
-
-  for (const brand of knownBrands) {
-    if (t.toLowerCase().includes(brand.toLowerCase())) return brand;
-  }
-
-  return titleWords(t).slice(0, 2).join(" ");
-}
-
-function extractModel(title, brand, mpn) {
-  const t = cleanText(title);
-  let model = t;
-
-  if (brand) {
-    const reBrand = new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    model = model.replace(reBrand, "").trim();
-  }
-
-  if (mpn) {
-    const reMpn = new RegExp(mpn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    model = model.replace(reMpn, "").trim();
-  }
-
-  model = model
-    .replace(/\b(new|used|open box|new open box|factory sealed|sealed)\b/ig, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return model.split(" ").slice(0, 4).join(" ");
-}
-
-function inferType(title, categoryId) {
-  const t = cleanText(title).toLowerCase();
-
-  if (["181708"].includes(String(categoryId))) return "PLC Processor";
-  if (["65459"].includes(String(categoryId))) return "Proximity Sensor";
-  if (t.includes("panelview") || t.includes("hmi") || t.includes("operator interface")) return "HMI";
-  if (t.includes("powerflex") || t.includes("vfd") || t.includes("drive")) return "Variable Frequency Drive";
-  if (t.includes("plc") || t.includes("compactlogix") || t.includes("controllogix") || t.includes("micrologix")) return "PLC Processor";
-  if (t.includes("sensor")) return "Sensor";
-  if (t.includes("module")) return "Module";
-  if (t.includes("conduit")) return "Conduit Fitting";
-
-  return "Industrial Automation Component";
-}
-
-function mapCategoryName(categoryId, title = "") {
-  const id = String(categoryId || "");
-  const t = cleanText(title).toLowerCase();
-
-  const categoryMap = {
-    "65459": "Proximity Sensors",
-    "181708": "PLC Processors",
-    "42894": "General Purpose Industrial Control",
-    "26261": "Other Business & Industrial",
-    "184027": "Hydraulic Valves",
-    "117490": "Conduit Fittings"
+  return {
+    itemNumber,
+    sku,
+    title,
+    currentPrice,
+    quantity,
+    condition,
+    cost
   };
-
-  if (categoryMap[id]) return categoryMap[id];
-  if (t.includes("sensor")) return "Other Sensors";
-  if (t.includes("plc")) return "PLC Processors";
-  if (t.includes("drive") || t.includes("vfd")) return "Variable Frequency Drives";
-  if (t.includes("panelview") || t.includes("hmi")) return "HMI & Open Interface Panels";
-
-  return "Other Business & Industrial";
 }
 
-function optimizeTitle(item) {
-  const condition = normalizeCondition(item.condition);
-
-  const parts = uniqueWords([
-    item.brand,
-    item.model,
-    item.mpn,
-    item.type,
-    ...item.specs,
-    condition
-  ]);
-
-  return truncateTitle(parts.join(" "));
-}
-
-function extractSpecs(title) {
-  const specs = [];
-  const tokens = titleWords(title);
-
-  for (const token of tokens) {
-    const up = token.toUpperCase();
-
-    if (/^\d+V$/.test(up)) specs.push(token);
-    else if (/^\d+HP$/.test(up)) specs.push(token);
-    else if (/^\d+PHASE$/.test(up)) specs.push(token);
-    else if (/^\d+[- ]?PHASE$/.test(up.replace(/\s+/g, ""))) specs.push(token);
-    else if (/^\d+MM$/.test(up)) specs.push(token);
-    else if (/^\d+IN$/.test(up)) specs.push(token);
-    else if (up === "TOUCH" || up === "TOUCHSCREEN") specs.push(token);
-  }
-
-  return uniqueWords(specs);
-}
-
-function detectIssues(item, allSkus) {
+function detectIssues(item) {
   const issues = [];
 
+  if (!item.itemNumber) issues.push("MISSING_ITEM_NUMBER");
   if (!item.sku) issues.push("MISSING_SKU");
-  if (item.sku && allSkus.get(item.sku) > 1) issues.push("DUPLICATE_SKU");
-  if (!item.title) issues.push("MISSING_TITLE");
-  if (!item.currentPrice || item.currentPrice <= 0) issues.push("INVALID_PRICE");
-  if (!item.photoUrls.length) issues.push("NO_PHOTOS");
-  if (!item.mpn) issues.push("MPN_MISSING");
-  if (item.mpn && !item.title.toLowerCase().includes(item.mpn.toLowerCase())) {
-    issues.push("MPN_NOT_IN_TITLE");
+  if (!item.currentPrice || Number(item.currentPrice) <= 0) issues.push("INVALID_PRICE");
+  if (!item.cost || Number(item.cost) <= 0) issues.push("NO_COST");
+  if (!item.quantity) issues.push("NO_QUANTITY");
+
+  if (
+    Number(item.cost) > 0 &&
+    Number(item.currentPrice) > 0 &&
+    Number(item.currentPrice) <= Number(item.cost)
+  ) {
+    issues.push("PRICE_AT_OR_BELOW_COST");
   }
-  if (!item.categoryId) issues.push("MISSING_CATEGORY_ID");
-  if (item.optimizedTitle.length < 20) issues.push("WEAK_TITLE");
-  if (item.optimizedTitle === item.title) issues.push("TITLE_UNCHANGED");
 
   return issues;
 }
 
-function calculateSuggestedPrice(item, compGroup) {
-  const compPrices = compGroup
-    .map(x => x.currentPrice)
-    .filter(v => Number.isFinite(v) && v > 0);
+function buildPriceCostRows(items) {
+  return items.map(item => {
+    const suggested = suggestPrice(item.currentPrice, item.cost, item.condition);
+    const issues = detectIssues(item);
 
-  if (!compPrices.length) return item.currentPrice;
-
-  const med = median(compPrices);
-  const condition = normalizeCondition(item.condition).toLowerCase();
-
-  let multiplier = 1.0;
-  if (condition === "new") multiplier = 1.08;
-  else if (condition === "new open box") multiplier = 1.02;
-  else if (condition === "used") multiplier = 0.9;
-  else if (condition.includes("parts")) multiplier = 0.6;
-
-  const suggested = roundEbayPrice(med * multiplier);
-  if (!suggested) return item.currentPrice;
-
-  if (item.currentPrice && suggested < item.currentPrice * 0.7) {
-    return item.currentPrice;
-  }
-
-  return suggested;
+    return {
+      Action: "Revise",
+      "Item number": item.itemNumber,
+      "Custom label (SKU)": item.sku,
+      Price: suggested || item.currentPrice,
+      Quantity: item.quantity,
+      "My cost": item.cost,
+      CurrentPrice: item.currentPrice,
+      Title: item.title,
+      Condition: normalizeCondition(item.condition),
+      Issues: issues.join("|")
+    };
+  });
 }
 
-function buildCompKey(item) {
-  if (item.mpn) return `mpn:${item.mpn.toLowerCase()}`;
-  return `title:${cleanText(item.title).split(" ").slice(0, 4).join(" ").toLowerCase()}`;
-}
+function buildPreviewRows(items) {
+  return items.map(item => {
+    const suggested = suggestPrice(item.currentPrice, item.cost, item.condition);
+    const issues = detectIssues(item);
 
-function mapEbayRow(row) {
-  const title = cleanText(getField(row, ["Title"]));
-  const sku = cleanText(getField(row, ["Custom label (SKU)", "Custom label", "SKU"]));
-  const currentPrice = parsePrice(getField(row, ["Current price", "Start price"]));
-  const startPrice = parsePrice(getField(row, ["Start price"]));
-  const condition = cleanText(getField(row, ["Condition"]));
-  const categoryId = cleanText(getField(row, ["eBay category 1", "eBay category", "eBay category ID"]));
-  const photoUrls = splitPhotoUrls(getField(row, ["Item photo URL", "Item photo urls", "Photo URL"]));
-  const brand = extractBrand(title);
-  const mpn = extractMpn(title);
-  const model = extractModel(title, brand, mpn);
-  const type = inferType(title, categoryId);
-  const specs = extractSpecs(title);
-
-  return {
-    raw: row,
-    sku,
-    title,
-    currentPrice,
-    startPrice,
-    condition,
-    categoryId,
-    photoUrls,
-    brand,
-    mpn,
-    model,
-    type,
-    specs
-  };
-}
-
-function buildAuditRows(items) {
-  return items.map(item => ({
-    SKU: item.sku,
-    CurrentTitle: item.title,
-    OptimizedTitle: item.optimizedTitle,
-    CurrentPrice: item.currentPrice ?? "",
-    SuggestedPrice: item.suggestedPrice ?? "",
-    PriceDelta: Number.isFinite(item.suggestedPrice) && Number.isFinite(item.currentPrice)
-      ? Number((item.suggestedPrice - item.currentPrice).toFixed(2))
-      : "",
-    Condition: item.normalizedCondition,
-    CategoryID: item.categoryId,
-    CategoryName: item.categoryName,
-    Brand: item.brand,
-    MPN: item.mpn,
-    Model: item.model,
-    Type: item.type,
-    PhotoCount: item.photoUrls.length,
-    Issues: item.issues.join("|")
-  }));
+    return {
+      sku: item.sku,
+      itemNumber: item.itemNumber,
+      title: item.title,
+      currentPrice: item.currentPrice,
+      suggestedPrice: suggested || item.currentPrice,
+      quantity: item.quantity,
+      myCost: item.cost,
+      condition: normalizeCondition(item.condition),
+      issues
+    };
+  });
 }
 
 export default {
@@ -439,7 +313,11 @@ export default {
     if (request.method === "GET") {
       return jsonResponse({
         ok: true,
-        message: "POST raw eBay CSV export. Optional query: ?preview=true"
+        message: "POST your eBay active listings CSV file.",
+        endpoints: {
+          preview: "POST https://ebay-export.mmarshalleet.workers.dev?preview=true",
+          priceCostCsv: "POST https://ebay-export.mmarshalleet.workers.dev?output=ebay-price-cost"
+        }
       });
     }
 
@@ -450,83 +328,78 @@ export default {
     try {
       const url = new URL(request.url);
       const preview = url.searchParams.get("preview") === "true";
-      const output = url.searchParams.get("output") || "csv";
+      const output = url.searchParams.get("output") || "ebay-price-cost";
 
       const csvText = await request.text();
-      if (!csvText || !csvText.trim()) {
+
+      if (!csvText.trim()) {
         return jsonResponse({ ok: false, error: "Empty CSV body." }, 400);
       }
 
-      const rows = parseCsv(csvText);
-      if (!rows.length) {
-        return jsonResponse({ ok: false, error: "No rows parsed from CSV." }, 400);
+      const parsedRows = parseCsv(csvText);
+
+      if (!parsedRows.length) {
+        return jsonResponse({ ok: false, error: "No rows found in CSV." }, 400);
       }
 
-      const mapped = rows.map(mapEbayRow);
-
-      const skuCounts = new Map();
-      for (const item of mapped) {
-        if (!item.sku) continue;
-        skuCounts.set(item.sku, (skuCounts.get(item.sku) || 0) + 1);
-      }
-
-      const compGroups = new Map();
-      for (const item of mapped) {
-        const key = buildCompKey(item);
-        if (!compGroups.has(key)) compGroups.set(key, []);
-        compGroups.get(key).push(item);
-      }
-
-      const finalItems = mapped.map(item => {
-        const normalizedCondition = normalizeCondition(item.condition);
-        const categoryName = mapCategoryName(item.categoryId, item.title);
-        const optimizedTitle = optimizeTitle({
-          ...item,
-          condition: normalizedCondition
-        });
-        const suggestedPrice = calculateSuggestedPrice(
-          { ...item, condition: normalizedCondition },
-          compGroups.get(buildCompKey(item)) || []
-        );
-
-        const enriched = {
-          ...item,
-          normalizedCondition,
-          categoryName,
-          optimizedTitle,
-          suggestedPrice
-        };
-
-        enriched.issues = detectIssues(enriched, skuCounts);
-        return enriched;
-      });
-
-      const auditRows = buildAuditRows(finalItems);
+      const items = parsedRows.map(mapEbayRow);
 
       if (preview) {
+        const previewRows = buildPreviewRows(items);
+
         return jsonResponse({
           ok: true,
           summary: {
-            totalRows: finalItems.length,
-            duplicateSkus: finalItems.filter(x => x.issues.includes("DUPLICATE_SKU")).length,
-            missingSku: finalItems.filter(x => x.issues.includes("MISSING_SKU")).length,
-            missingMpn: finalItems.filter(x => x.issues.includes("MPN_MISSING")).length,
-            noPhotos: finalItems.filter(x => x.issues.includes("NO_PHOTOS")).length,
-            changedTitles: finalItems.filter(x => x.optimizedTitle !== x.title).length
+            totalRows: previewRows.length,
+            missingItemNumber: previewRows.filter(x =>
+              x.issues.includes("MISSING_ITEM_NUMBER")
+            ).length,
+            missingSku: previewRows.filter(x =>
+              x.issues.includes("MISSING_SKU")
+            ).length,
+            noCost: previewRows.filter(x =>
+              x.issues.includes("NO_COST")
+            ).length,
+            noQuantity: previewRows.filter(x =>
+              x.issues.includes("NO_QUANTITY")
+            ).length,
+            priceAtOrBelowCost: previewRows.filter(x =>
+              x.issues.includes("PRICE_AT_OR_BELOW_COST")
+            ).length
           },
-          rows: auditRows.slice(0, 100)
+          rows: previewRows.slice(0, 100)
         });
       }
 
-      if (output === "json") {
-        return jsonResponse({
-          ok: true,
-          rows: auditRows
-        });
+      if (output === "ebay-price-cost") {
+        const rows = buildPriceCostRows(items);
+
+        const headers = [
+          "Action",
+          "Item number",
+          "Custom label (SKU)",
+          "Price",
+          "Quantity",
+          "My cost",
+          "CurrentPrice",
+          "Title",
+          "Condition",
+          "Issues"
+        ];
+
+        return csvResponse(
+          toCsv(rows, headers),
+          "eBay-edit-price-quantity-with-cost.csv"
+        );
       }
 
-      const outCsv = toCsv(auditRows);
-      return textResponse(outCsv, "ebay_active_listing_audit.csv");
+      return jsonResponse(
+        {
+          ok: false,
+          error: `Unknown output mode: ${output}`
+        },
+        400
+      );
     } catch (error) {
       return jsonResponse(
         {
