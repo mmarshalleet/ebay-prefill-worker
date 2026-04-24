@@ -1,3 +1,21 @@
+const INFO_ROW =
+  "#INFO,Version=1.0.0,Template= eBay-active-revise-price-quantity-download_US,,,,,,,,,";
+
+const EBAY_HEADERS = [
+  "Action",
+  "Category name",
+  "Item number",
+  "Title",
+  "Listing site",
+  "Currency",
+  "Start price",
+  "Buy It Now price",
+  "Available quantity",
+  "Relationship",
+  "Relationship details",
+  "Custom label (SKU)"
+];
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -8,7 +26,7 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function csvResponse(text, filename = "eBay-edit-price-quantity-with-cost.csv") {
+function csvResponse(text, filename = "eBay-edit-price-quantity.csv") {
   return new Response(text, {
     status: 200,
     headers: {
@@ -26,18 +44,51 @@ function cleanText(value) {
 function parsePrice(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return "";
-
   const cleaned = raw.replace(/[^0-9.-]/g, "");
   if (!cleaned) return "";
-
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : "";
-
 }
+
 function escapeCsv(value) {
   const s = String(value ?? "");
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
+}
+
+function parseDelimitedLine(line, delimiter) {
+  if (delimiter === "\t") return line.split("\t");
+
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+
+    if (ch === '"' && inQuotes && next === '"') {
+      current += '"';
+      i++;
+    } else if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+
+  result.push(current);
+  return result;
+}
+
+function detectDelimiter(lines) {
+  const sample = lines.slice(0, 10).join("\n");
+  const commaCount = (sample.match(/,/g) || []).length;
+  const tabCount = (sample.match(/\t/g) || []).length;
+  return tabCount > commaCount ? "\t" : ",";
 }
 
 function parseCsv(csvText) {
@@ -50,89 +101,36 @@ function parseCsv(csvText) {
 
   if (!rawLines.length) return [];
 
-  // Detect delimiter
-  const sample = rawLines.slice(0, 10).join("\n");
-  const commaCount = (sample.match(/,/g) || []).length;
-  const tabCount = (sample.match(/\t/g) || []).length;
-  const delimiter = tabCount > commaCount ? "\t" : ",";
+  const delimiter = detectDelimiter(rawLines);
 
-  function parseLine(line) {
-    if (delimiter === "\t") return line.split("\t");
-
-    const result = [];
-    let current = "";
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      const next = line[i + 1];
-
-      if (ch === '"' && inQuotes && next === '"') {
-        current += '"';
-        i++;
-      } else if (ch === '"') {
-        inQuotes = !inQuotes;
-      } else if (ch === "," && !inQuotes) {
-        result.push(current);
-        current = "";
-      } else {
-        current += ch;
-      }
-    }
-
-    result.push(current);
-    return result;
-  }
-
-  // Find actual header row
   const headerIndex = rawLines.findIndex(line => {
-    const cols = parseLine(line).map(cleanText);
+    const cols = parseDelimitedLine(line, delimiter).map(cleanText);
     return (
-      cols.includes("Item number") ||
-      cols.includes("Item Number") ||
-      cols.includes("Custom label (SKU)") ||
-      cols.includes("Title")
+      cols.includes("Action") &&
+      (cols.includes("Item number") ||
+        cols.includes("Item Number") ||
+        cols.includes("Custom label (SKU)") ||
+        cols.includes("Title"))
     );
   });
 
   if (headerIndex === -1) {
     throw new Error(
-      "Could not find eBay header row. Expected columns like Item number, Title, or Custom label (SKU)."
+      "Could not find eBay header row. Expected a row containing Action, Item number, Title, or Custom label (SKU)."
     );
   }
 
-  const headers = parseLine(rawLines[headerIndex]).map(cleanText);
+  const headers = parseDelimitedLine(rawLines[headerIndex], delimiter).map(cleanText);
   const dataLines = rawLines.slice(headerIndex + 1);
 
   return dataLines.map(line => {
-    const values = parseLine(line);
+    const values = parseDelimitedLine(line, delimiter);
     const row = {};
 
     headers.forEach((header, i) => {
       row[header] = values[i] ?? "";
     });
 
-    return row;
-  });
-}
-
-function parseCsv(csvText) {
-  const lines = String(csvText ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .filter(line => line.trim());
-
-  if (!lines.length) return [];
-
-  const headers = parseCsvLine(lines[0]).map(cleanText);
-
-  return lines.slice(1).map(line => {
-    const values = parseCsvLine(line);
-    const row = {};
-    headers.forEach((header, i) => {
-      row[header] = values[i] ?? "";
-    });
     return row;
   });
 }
@@ -203,11 +201,9 @@ function suggestPrice(currentPrice, cost, condition) {
 
   let proposed = current * multiplier;
 
-  // Guardrail: never auto-drop more than 20%
   const maxDropPrice = current * 0.8;
   if (proposed < maxDropPrice) proposed = maxDropPrice;
 
-  // Guardrail: if cost exists, keep at least 35% above cost
   if (Number.isFinite(itemCost) && itemCost > 0) {
     const minPrice = itemCost * 1.35;
     if (proposed < minPrice) proposed = minPrice;
@@ -225,43 +221,33 @@ function toCsv(rows, headers) {
 
 function mapEbayRow(row) {
   const itemNumber = cleanText(
-    getField(row, [
-      "Item number",
-      "Item Number",
-      "Item ID",
-      "Item Id",
-      "ItemID"
-    ])
+    getField(row, ["Item number", "Item Number", "Item ID", "Item Id", "ItemID"])
   );
 
-  const sku = cleanText(
-    getField(row, [
-      "Custom label (SKU)",
-      "Custom Label (SKU)",
-      "Custom label",
-      "Custom Label",
-      "SKU"
-    ])
+  const categoryName = cleanText(
+    getField(row, ["Category name", "Category Name", "Category"])
   );
 
-  const title = cleanText(
-    getField(row, [
-      "Title",
-      "Item title",
-      "Listing title"
-    ])
-  );
+  const title = cleanText(getField(row, ["Title", "Item title", "Listing title"]));
+
+  const listingSite = cleanText(getField(row, ["Listing site", "Listing Site"])) || "US";
+
+  const currency = cleanText(getField(row, ["Currency"])) || "USD";
 
   const currentPrice = parsePrice(
     getField(row, [
-      "Current price",
-      "Current Price",
       "Start price",
       "Start Price",
+      "Current price",
+      "Current Price",
       "Price",
       "Buy It Now price",
       "Buy It Now Price"
     ])
+  );
+
+  const buyItNowPrice = parsePrice(
+    getField(row, ["Buy It Now price", "Buy It Now Price"])
   );
 
   const quantity = cleanText(
@@ -274,10 +260,19 @@ function mapEbayRow(row) {
     ])
   );
 
-  const condition = cleanText(
+  const relationship = cleanText(getField(row, ["Relationship"]));
+
+  const relationshipDetails = cleanText(
+    getField(row, ["Relationship details", "Relationship Details"])
+  );
+
+  const sku = cleanText(
     getField(row, [
-      "Condition",
-      "Item condition"
+      "Custom label (SKU)",
+      "Custom Label (SKU)",
+      "Custom label",
+      "Custom Label",
+      "SKU"
     ])
   );
 
@@ -293,14 +288,22 @@ function mapEbayRow(row) {
     ])
   );
 
+  const condition = cleanText(getField(row, ["Condition", "Item condition"]));
+
   return {
     itemNumber,
-    sku,
+    categoryName,
     title,
+    listingSite,
+    currency,
     currentPrice,
+    buyItNowPrice,
     quantity,
-    condition,
-    cost
+    relationship,
+    relationshipDetails,
+    sku,
+    cost,
+    condition
   };
 }
 
@@ -310,8 +313,11 @@ function detectIssues(item) {
   if (!item.itemNumber) issues.push("MISSING_ITEM_NUMBER");
   if (!item.sku) issues.push("MISSING_SKU");
   if (!item.currentPrice || Number(item.currentPrice) <= 0) issues.push("INVALID_PRICE");
-  if (!item.cost || Number(item.cost) <= 0) issues.push("NO_COST");
   if (!item.quantity) issues.push("NO_QUANTITY");
+
+  if (!item.cost || Number(item.cost) <= 0) {
+    issues.push("NO_COST");
+  }
 
   if (
     Number(item.cost) > 0 &&
@@ -324,41 +330,44 @@ function detectIssues(item) {
   return issues;
 }
 
-function buildPriceCostRows(items) {
+function buildEbayPriceQuantityRows(items) {
   return items.map(item => {
     const suggested = suggestPrice(item.currentPrice, item.cost, item.condition);
-    const issues = detectIssues(item);
+    const newPrice = suggested || item.currentPrice;
 
     return {
       Action: "Revise",
+      "Category name": item.categoryName,
       "Item number": item.itemNumber,
-      "Custom label (SKU)": item.sku,
-      Price: suggested || item.currentPrice,
-      Quantity: item.quantity,
-      "My cost": item.cost,
-      CurrentPrice: item.currentPrice,
       Title: item.title,
-      Condition: normalizeCondition(item.condition),
-      Issues: issues.join("|")
+      "Listing site": item.listingSite || "US",
+      Currency: item.currency || "USD",
+      "Start price": newPrice,
+      "Buy It Now price": item.buyItNowPrice || "",
+      "Available quantity": item.quantity,
+      Relationship: item.relationship,
+      "Relationship details": item.relationshipDetails,
+      "Custom label (SKU)": item.sku
     };
   });
 }
 
-function buildPreviewRows(items) {
+function buildAuditRows(items) {
   return items.map(item => {
     const suggested = suggestPrice(item.currentPrice, item.cost, item.condition);
     const issues = detectIssues(item);
 
     return {
-      sku: item.sku,
-      itemNumber: item.itemNumber,
-      title: item.title,
-      currentPrice: item.currentPrice,
-      suggestedPrice: suggested || item.currentPrice,
-      quantity: item.quantity,
-      myCost: item.cost,
-      condition: normalizeCondition(item.condition),
-      issues
+      SKU: item.sku,
+      "Item number": item.itemNumber,
+      Title: item.title,
+      Category: item.categoryName,
+      CurrentPrice: item.currentPrice,
+      SuggestedPrice: suggested || item.currentPrice,
+      Quantity: item.quantity,
+      MyCost: item.cost,
+      Condition: normalizeCondition(item.condition),
+      Issues: issues.join("|")
     };
   });
 }
@@ -368,10 +377,12 @@ export default {
     if (request.method === "GET") {
       return jsonResponse({
         ok: true,
-        message: "POST your eBay active listings CSV file.",
+        message: "POST eBay edit price/quantity CSV template or active listings CSV.",
         endpoints: {
+          ebayUploadCsv:
+            "POST https://ebay-export.mmarshalleet.workers.dev?output=ebay-price-cost",
           preview: "POST https://ebay-export.mmarshalleet.workers.dev?preview=true",
-          priceCostCsv: "POST https://ebay-export.mmarshalleet.workers.dev?output=ebay-price-cost"
+          audit: "POST https://ebay-export.mmarshalleet.workers.dev?output=audit"
         }
       });
     }
@@ -392,60 +403,64 @@ export default {
       }
 
       const parsedRows = parseCsv(csvText);
-
-      if (!parsedRows.length) {
-        return jsonResponse({ ok: false, error: "No rows found in CSV." }, 400);
-      }
-
       const items = parsedRows.map(mapEbayRow);
 
+      if (!items.length) {
+        return jsonResponse({ ok: false, error: "No data rows found." }, 400);
+      }
+
       if (preview) {
-        const previewRows = buildPreviewRows(items);
+        const auditRows = buildAuditRows(items);
 
         return jsonResponse({
           ok: true,
           summary: {
-            totalRows: previewRows.length,
-            missingItemNumber: previewRows.filter(x =>
-              x.issues.includes("MISSING_ITEM_NUMBER")
+            totalRows: auditRows.length,
+            missingItemNumber: auditRows.filter(x =>
+              x.Issues.includes("MISSING_ITEM_NUMBER")
             ).length,
-            missingSku: previewRows.filter(x =>
-              x.issues.includes("MISSING_SKU")
-            ).length,
-            noCost: previewRows.filter(x =>
-              x.issues.includes("NO_COST")
-            ).length,
-            noQuantity: previewRows.filter(x =>
-              x.issues.includes("NO_QUANTITY")
-            ).length,
-            priceAtOrBelowCost: previewRows.filter(x =>
-              x.issues.includes("PRICE_AT_OR_BELOW_COST")
+            missingSku: auditRows.filter(x => x.Issues.includes("MISSING_SKU")).length,
+            noCost: auditRows.filter(x => x.Issues.includes("NO_COST")).length,
+            noQuantity: auditRows.filter(x => x.Issues.includes("NO_QUANTITY")).length,
+            priceAtOrBelowCost: auditRows.filter(x =>
+              x.Issues.includes("PRICE_AT_OR_BELOW_COST")
             ).length
           },
-          rows: previewRows.slice(0, 100)
+          rows: auditRows.slice(0, 100)
         });
       }
 
-      if (output === "ebay-price-cost") {
-        const rows = buildPriceCostRows(items);
-
-        const headers = [
-          "Action",
-          "Item number",
-          "Custom label (SKU)",
-          "Price",
-          "Quantity",
-          "My cost",
-          "CurrentPrice",
-          "Title",
-          "Condition",
-          "Issues"
-        ];
-
+      if (output === "audit") {
         return csvResponse(
-          toCsv(rows, headers),
-          "eBay-edit-price-quantity-with-cost.csv"
+          toCsv(
+            buildAuditRows(items),
+            [
+              "SKU",
+              "Item number",
+              "Title",
+              "Category",
+              "CurrentPrice",
+              "SuggestedPrice",
+              "Quantity",
+              "MyCost",
+              "Condition",
+              "Issues"
+            ]
+          ),
+          "eBay-price-quantity-audit.csv"
         );
+      }
+
+      if (output === "ebay-price-cost") {
+        const ebayRows = buildEbayPriceQuantityRows(items);
+
+        const csv =
+          "\uFEFF" +
+          INFO_ROW +
+          "\n" +
+          toCsv(ebayRows, EBAY_HEADERS);
+
+        return csvResponse(csv, "eBay-edit-price-quantity.csv");
       }
 
       return jsonResponse(
@@ -459,7 +474,7 @@ export default {
       return jsonResponse(
         {
           ok: false,
-          error: error?.message || "Update failed."
+          error: error?.message || "Worker failed."
         },
         500
       );
