@@ -24,41 +24,96 @@ function cleanText(value) {
 }
 
 function parsePrice(value) {
-  const cleaned = String(value ?? "").replace(/[^0-9.-]/g, "");
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+
+  const cleaned = raw.replace(/[^0-9.-]/g, "");
+  if (!cleaned) return "";
+
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : "";
-}
 
+}
 function escapeCsv(value) {
   const s = String(value ?? "");
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
-function parseCsvLine(line) {
-  const result = [];
-  let current = "";
-  let inQuotes = false;
+function parseCsv(csvText) {
+  const rawLines = String(csvText ?? "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter(line => line.trim().length > 0);
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    const next = line[i + 1];
+  if (!rawLines.length) return [];
 
-    if (ch === '"' && inQuotes && next === '"') {
-      current += '"';
-      i++;
-    } else if (ch === '"') {
-      inQuotes = !inQuotes;
-    } else if (ch === "," && !inQuotes) {
-      result.push(current);
-      current = "";
-    } else {
-      current += ch;
+  // Detect delimiter
+  const sample = rawLines.slice(0, 10).join("\n");
+  const commaCount = (sample.match(/,/g) || []).length;
+  const tabCount = (sample.match(/\t/g) || []).length;
+  const delimiter = tabCount > commaCount ? "\t" : ",";
+
+  function parseLine(line) {
+    if (delimiter === "\t") return line.split("\t");
+
+    const result = [];
+    let current = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      const next = line[i + 1];
+
+      if (ch === '"' && inQuotes && next === '"') {
+        current += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = !inQuotes;
+      } else if (ch === "," && !inQuotes) {
+        result.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
     }
+
+    result.push(current);
+    return result;
   }
 
-  result.push(current);
-  return result;
+  // Find actual header row
+  const headerIndex = rawLines.findIndex(line => {
+    const cols = parseLine(line).map(cleanText);
+    return (
+      cols.includes("Item number") ||
+      cols.includes("Item Number") ||
+      cols.includes("Custom label (SKU)") ||
+      cols.includes("Title")
+    );
+  });
+
+  if (headerIndex === -1) {
+    throw new Error(
+      "Could not find eBay header row. Expected columns like Item number, Title, or Custom label (SKU)."
+    );
+  }
+
+  const headers = parseLine(rawLines[headerIndex]).map(cleanText);
+  const dataLines = rawLines.slice(headerIndex + 1);
+
+  return dataLines.map(line => {
+    const values = parseLine(line);
+    const row = {};
+
+    headers.forEach((header, i) => {
+      row[header] = values[i] ?? "";
+    });
+
+    return row;
+  });
 }
 
 function parseCsv(csvText) {
