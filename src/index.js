@@ -404,7 +404,7 @@ export default {
       return jsonResponse(
         {
           ok: false,
-          error: error?.message || "failed."
+          error: error?.message || "Update failed."
         },
         500
       );
