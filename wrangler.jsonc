@@ -1,7 +1,14 @@
 {
   "name": "ebay-prefill-worker",
   "main": "src/index.js",
-  "compatibility_date": "2026-04-21"
+  "compatibility_date": "2026-04-21",
+  "vars": {
+    "EBAY_MARKETPLACE_ID": "EBAY_US"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "DRAFT_KV",
+      "id": "d76930f9d9b34001ba8359bc456b5b95"
+    }
+  ]
 }
-binding = "DRAFT_KV"
-id = "d76930f9d9b34001ba8359bc456b5b95"
