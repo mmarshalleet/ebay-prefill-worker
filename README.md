@@ -23,10 +23,12 @@ Optional form fields:
 - `notes`
 - `condition`
 - `quantity`
+- `ocrText`: text recognized by the Shortcut or another OCR step from labels, plates, stickers, or packaging
 
 The response includes:
 
 - OpenAI item identification
+- saved OCR text, when provided
 - eBay search query
 - active fixed-price Browse API comps
 - suggested price calculated as `median active comps * 0.95`
@@ -222,9 +224,11 @@ Create a Shortcut that:
 2. Sends a `POST` request to `https://your-worker.your-subdomain.workers.dev/draft`.
 3. Sets the request body to `Form`.
 4. Adds each selected photo under the form key `images`.
-5. Optionally adds text fields named `notes`, `condition`, and `quantity`.
+5. Optionally adds text fields named `notes`, `condition`, `quantity`, and `ocrText`.
 6. Reads the JSON response and presents it for review.
 7. If the response contains `missingRequiredAspects`, asks for those values and sends them back to `/approve` as `itemSpecifics`.
+
+For better identification and comp search, add an OCR step in the Shortcut and pass recognized text as `ocrText`. The Worker tells OpenAI to treat OCR as a likely source for catalog numbers, MPNs, model numbers, manufacturer names, voltage, and part numbers, while ignoring obvious serial numbers unless they help identify the product family. The eBay comp search query is built from MPN, model, brand, title, and exact OCR-looking part numbers.
 
 To approve a draft for later publishing, send JSON to `/approve`:
 
@@ -264,7 +268,8 @@ curl -X POST http://localhost:8787/draft \
   -F "images=@/path/to/photo2.jpg" \
   -F "notes=Includes box and charger" \
   -F "condition=Used" \
-  -F "quantity=1"
+  -F "quantity=1" \
+  -F "ocrText=Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16"
 ```
 
 Fetch a draft:

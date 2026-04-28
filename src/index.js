@@ -148,16 +148,18 @@ async function createDraft(request, env) {
 
   const notes = stringField(formData, "notes");
   const requestedCondition = stringField(formData, "condition");
+  const ocrText = stringField(formData, "ocrText");
   const quantity = positiveIntegerField(formData, "quantity", 1);
   const images = await Promise.all(imageFiles.map(fileToOpenAIImagePart));
 
   const identification = await identifyItemWithOpenAI(env.OPENAI_API_KEY, images, {
     notes,
     condition: requestedCondition,
-    quantity
+    quantity,
+    ocrText
   });
 
-  const searchQuery = buildEbaySearchQuery(identification);
+  const searchQuery = buildEbaySearchQuery(identification, ocrText);
   const ebayToken = await getEbayToken(env);
   const comps = await searchEbayComps(env, ebayToken, searchQuery);
   const suggestedPrice = calculateSuggestedPrice(comps);
@@ -175,12 +177,14 @@ async function createDraft(request, env) {
     mpn: identification.mpn,
     condition: identification.condition,
     categoryHint: identification.categoryHint,
+    ocrText,
     itemSpecifics: normalizeItemSpecifics(identification.itemSpecifics),
     descriptionBullets: identification.descriptionBullets,
     imageUrls: [],
     input: {
       notes,
       requestedCondition,
+      ocrText,
       quantity,
       imageCount: imageFiles.length
     },
@@ -355,10 +359,15 @@ async function identifyItemWithOpenAI(apiKey, imageParts, input) {
     "Return ONLY valid JSON matching the requested schema.",
     "Use empty strings when a brand, model, or MPN cannot be determined.",
     "Use itemSpecifics as concise eBay-style name/value facts visible or strongly inferable from the photos.",
+    "Image OCR text may contain model, MPN, serial, voltage, part number, manufacturer, or catalog number.",
+    "Prefer exact catalog and MPN values from OCR text when they are visible.",
+    "Ignore obvious serial numbers unless they are useful for identifying the product family.",
+    "Return OCR-derived fields in itemSpecifics when relevant.",
     "Keep the title under 80 characters and avoid unsupported claims.",
     `Seller notes: ${input.notes || "none"}`,
     `Seller condition hint: ${input.condition || "none"}`,
-    `Quantity: ${input.quantity}`
+    `Quantity: ${input.quantity}`,
+    `Image OCR text:\n${truncateForPrompt(input.ocrText || "none", 12000)}`
   ].join("\n");
 
   const response = await fetch(OPENAI_RESPONSES_URL, {
@@ -626,13 +635,61 @@ function calculateSuggestedPrice(comps) {
   return roundCurrency(median * 0.95);
 }
 
-function buildEbaySearchQuery(identification) {
+function buildEbaySearchQuery(identification, ocrText = "") {
   return dedupeWords([
-    identification.brand,
-    identification.model,
     identification.mpn,
-    identification.title
-  ], 12);
+    identification.model,
+    identification.brand,
+    identification.title,
+    ...extractOcrPartNumbers(ocrText)
+  ], 18);
+}
+
+function extractOcrPartNumbers(ocrText) {
+  const text = stringValue(ocrText);
+  if (!text) {
+    return [];
+  }
+
+  const candidates = [];
+  const labeledValuePattern = /\b(?:mpn|m\.?p\.?n\.?|model(?:\s*(?:no\.?|number|#))?|part(?:\s*(?:no\.?|number|#))?|p\/n|pn|catalog(?:\s*(?:no\.?|number|#))?|cat(?:\.|\s)*(?:no\.?|number|#)?|mfr(?:\s+part)?(?:\s*(?:no\.?|number|#))?|manufacturer\s+part(?:\s*(?:no\.?|number|#))?)\s*[:#-]?\s*([a-z0-9][a-z0-9._/-]{2,})/gi;
+  const genericPartPattern = /\b(?:[a-z0-9]{2,}(?:[-./][a-z0-9]{2,})+|(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*\d)[a-z0-9][a-z0-9-]{3,})\b/gi;
+
+  for (const line of text.split(/\r?\n/)) {
+    const hasPartLabel = /\b(?:mpn|m\.?p\.?n\.?|model|part|p\/n|pn|catalog|cat\.?|mfr|manufacturer\s+part)\b/i.test(line);
+    const hasSerialLabel = /\b(?:serial|s\/n|sn)\b/i.test(line);
+
+    if (hasPartLabel) {
+      for (const match of line.matchAll(labeledValuePattern)) {
+        candidates.push(cleanOcrPartNumber(match[1]));
+      }
+      continue;
+    }
+
+    if (hasSerialLabel) {
+      continue;
+    }
+
+    for (const match of line.matchAll(genericPartPattern)) {
+      candidates.push(cleanOcrPartNumber(match[0]));
+    }
+  }
+
+  return uniqueNonEmpty(candidates)
+    .filter((candidate) => !isLikelyMeasurement(candidate))
+    .slice(0, 8);
+}
+
+function cleanOcrPartNumber(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^[#:\s]+/, "")
+    .replace(/[),;:]+$/g, "")
+    .replace(/[^a-z0-9._/-]/gi, "");
+}
+
+function isLikelyMeasurement(value) {
+  return /^\d+(?:\.\d+)?(?:v|vac|vdc|a|amp|amps|hz|w|kw|hp|ma|dc|ac)$/i.test(value);
 }
 
 function buildCategoryQuery(draft) {
@@ -844,7 +901,7 @@ function dedupeWords(parts, limit) {
 
   return parts
     .flatMap((part) => String(part || "").split(/\s+/))
-    .map((part) => part.replace(/[^\w.-]/g, "").trim())
+    .map((part) => part.replace(/[^\w./-]/g, "").trim())
     .filter(Boolean)
     .filter((part) => {
       const key = part.toLowerCase();
@@ -856,6 +913,23 @@ function dedupeWords(parts, limit) {
     })
     .slice(0, limit)
     .join(" ");
+}
+
+function uniqueNonEmpty(values) {
+  const seen = new Set();
+  const unique = [];
+
+  for (const value of values) {
+    const cleaned = stringValue(value);
+    const key = cleaned.toLowerCase();
+    if (!cleaned || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(cleaned);
+  }
+
+  return unique;
 }
 
 function buildDescription(draft) {
@@ -894,6 +968,14 @@ function positiveIntegerField(formData, key, fallback) {
 
 function stringValue(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function truncateForPrompt(value, maxLength) {
+  const text = stringValue(value);
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}\n[truncated]`;
 }
 
 function clampNumber(value, min, max) {
