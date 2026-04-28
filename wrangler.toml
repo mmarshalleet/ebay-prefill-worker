@@ -1,0 +1,11 @@
+name = "ebay-photo-listing-draft-worker"
+main = "src/index.js"
+compatibility_date = "2026-04-28"
+
+[vars]
+EBAY_MARKETPLACE_ID = "EBAY_US"
+
+[[kv_namespaces]]
+binding = "DRAFT_KV"
+id = "replace_with_production_kv_namespace_id"
+preview_id = "replace_with_preview_kv_namespace_id"
