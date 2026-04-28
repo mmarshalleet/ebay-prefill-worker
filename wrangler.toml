@@ -9,3 +9,6 @@ EBAY_MARKETPLACE_ID = "EBAY_US"
 binding = "DRAFT_KV"
 id = "d76930f9d9b34001ba8359bc456b5b95"
 preview_id = "363498ff7e264a83bd86186249377efe"
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "ebay-images"
