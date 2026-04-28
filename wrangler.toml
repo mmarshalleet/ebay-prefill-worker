@@ -7,5 +7,5 @@ EBAY_MARKETPLACE_ID = "EBAY_US"
 
 [[kv_namespaces]]
 binding = "DRAFT_KV"
-id = "replace_with_production_kv_namespace_id"
-preview_id = "replace_with_preview_kv_namespace_id"
+id = "d76930f9d9b34001ba8359bc456b5b95"
+preview_id = "363498ff7e264a83bd86186249377efe"
