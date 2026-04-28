@@ -293,7 +293,7 @@ GET /commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category
 Create a Shortcut that:
 
 1. Selects or takes photos.
-2. Sends a `POST` request to `https://your-worker.your-subdomain.workers.dev/draft`.
+2. Sends a `POST` request to `https://ebay-prefill-worker.mmarshalleet.workers.dev/draft`.
 3. Sets the request body to `Form`.
 4. Adds each selected photo under the form key `images`.
 5. Optionally adds text fields named `notes`, `condition`, `quantity`, `ocrText`, `priceMode`, `cost`, and `desiredMarginPercent`.
