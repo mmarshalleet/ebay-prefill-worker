@@ -1,6 +1,6 @@
 # eBay Photo Listing Draft Worker
 
-Cloudflare Worker for turning iOS Shortcut photo uploads into private eBay listing drafts. It identifies the item with OpenAI Vision, searches active fixed-price eBay Browse API comps, suggests a price, stores the draft in KV, and returns JSON for review.
+Cloudflare Worker for turning iOS Shortcut photo uploads into private eBay listing drafts. It identifies the item with OpenAI Vision, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
 
 Publishing is deliberately gated. `POST /approve` only marks a saved draft as `ready_to_publish_later`; it does not call any eBay listing or inventory publish API.
 
@@ -30,7 +30,37 @@ The response includes:
 - eBay search query
 - active fixed-price Browse API comps
 - suggested price calculated as `median active comps * 0.95`
+- automatic eBay category selection from the Taxonomy API
+- required and recommended item specifics for the selected category
+- missing required item specifics, if eBay requires values the photos did not provide
 - the KV draft id
+
+If no category can be determined, the Worker returns:
+
+```json
+{
+  "error": "category_required",
+  "message": "No eBay category could be determined.",
+  "query": "...",
+  "draft": {}
+}
+```
+
+If required item specifics are missing, the Worker returns:
+
+```json
+{
+  "error": "missing_required_item_specifics",
+  "categoryId": "...",
+  "categoryName": "...",
+  "missingRequiredAspects": ["Brand", "MPN"],
+  "requiredAspects": [],
+  "recommendedAspects": [],
+  "draft": {}
+}
+```
+
+The draft remains saved in KV so the missing values can be supplied later.
 
 ### `GET /draft?id=...`
 
@@ -44,6 +74,22 @@ Accepts:
 { "draftId": "..." }
 ```
 
+Optional overrides:
+
+```json
+{
+  "draftId": "...",
+  "categoryId": "262222",
+  "itemSpecifics": {
+    "Brand": "Allen-Bradley",
+    "MPN": "1756-IB16",
+    "Model": "1756-IB16"
+  }
+}
+```
+
+If `categoryId` is provided, it is used instead of the auto-selected category. If `itemSpecifics` are provided, they are merged over the AI-detected values and validated against eBay's required aspects for the category.
+
 Returns the draft with:
 
 ```json
@@ -51,6 +97,43 @@ Returns the draft with:
 ```
 
 No eBay publish APIs are called.
+
+## Category and Item Specifics
+
+The Worker uses the eBay Taxonomy API to choose a category automatically:
+
+```text
+GET https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=QUERY
+```
+
+The query is built from the draft title, brand, model, MPN, and category hint. The first eBay suggestion is used as the default category.
+
+After a category is selected, the Worker fetches aspect metadata:
+
+```text
+GET https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=CATEGORY_ID
+```
+
+It then merges AI-detected item specifics with `Brand`, `MPN`, `Model`, and manual overrides. Aspect values are prepared in eBay Inventory API format:
+
+```json
+{
+  "product": {
+    "title": "Allen-Bradley 1756-IB16 Input Module",
+    "description": "- Used condition\n- Pulled from working equipment",
+    "brand": "Allen-Bradley",
+    "mpn": "1756-IB16",
+    "aspects": {
+      "Brand": ["Allen-Bradley"],
+      "MPN": ["1756-IB16"],
+      "Model": ["1756-IB16"]
+    },
+    "imageUrls": []
+  }
+}
+```
+
+This payload is only returned and saved as a draft. The Worker does not call `publishOffer` or any other eBay publishing API.
 
 ## Cloudflare Setup
 
@@ -124,6 +207,13 @@ with the filter:
 buyingOptions:{FIXED_PRICE}
 ```
 
+The Taxonomy API calls use:
+
+```text
+GET /commerce/taxonomy/v1/category_tree/0/get_category_suggestions
+GET /commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category
+```
+
 ## iOS Shortcut Usage
 
 Create a Shortcut that:
@@ -134,11 +224,26 @@ Create a Shortcut that:
 4. Adds each selected photo under the form key `images`.
 5. Optionally adds text fields named `notes`, `condition`, and `quantity`.
 6. Reads the JSON response and presents it for review.
+7. If the response contains `missingRequiredAspects`, asks for those values and sends them back to `/approve` as `itemSpecifics`.
 
 To approve a draft for later publishing, send JSON to `/approve`:
 
 ```json
 { "draftId": "the-id-from-draft-response" }
+```
+
+To supply missing values or override the category, send:
+
+```json
+{
+  "draftId": "the-id-from-draft-response",
+  "categoryId": "262222",
+  "itemSpecifics": {
+    "Brand": "Allen-Bradley",
+    "MPN": "1756-IB16",
+    "Model": "1756-IB16"
+  }
+}
 ```
 
 This approval step still does not publish anything to eBay.

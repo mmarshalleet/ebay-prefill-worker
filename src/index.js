@@ -13,6 +13,7 @@ const JSON_HEADERS = {
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token";
 const EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search";
+const EBAY_TAXONOMY_TREE_URL = "https://api.ebay.com/commerce/taxonomy/v1/category_tree/0";
 const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope";
 
 const listingSchema = {
@@ -56,6 +57,20 @@ const listingSchema = {
   additionalProperties: false
 };
 
+class ExternalApiError extends Error {
+  constructor(service, status, payload) {
+    const message = payload?.error?.message
+      || payload?.error_description
+      || payload?.message
+      || `${service} request failed.`;
+    super(`${service} error (${status}): ${message}`);
+    this.name = "ExternalApiError";
+    this.service = service;
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -74,7 +89,7 @@ export default {
             { method: "GET", path: "/", description: "Worker status and endpoint list" },
             { method: "POST", path: "/draft", description: "Create a draft from item photos" },
             { method: "GET", path: "/draft?id=...", description: "Retrieve a saved draft" },
-            { method: "POST", path: "/approve", description: "Mark a draft as ready for later publishing" }
+            { method: "POST", path: "/approve", description: "Validate overrides and mark a draft ready for later publishing" }
           ]
         });
       }
@@ -95,6 +110,16 @@ export default {
 
       return jsonResponse({ error: "not_found" }, 404);
     } catch (error) {
+      if (error instanceof ExternalApiError) {
+        return jsonResponse({
+          error: "external_api_error",
+          service: error.service,
+          status: error.status,
+          message: error.message,
+          raw: error.payload
+        }, 502);
+      }
+
       return jsonResponse({
         error: "internal_error",
         message: error instanceof Error ? error.message : "Unexpected error"
@@ -144,6 +169,15 @@ async function createDraft(request, env) {
     publishEnabled: false,
     createdAt: now,
     updatedAt: now,
+    title: identification.title,
+    brand: identification.brand,
+    model: identification.model,
+    mpn: identification.mpn,
+    condition: identification.condition,
+    categoryHint: identification.categoryHint,
+    itemSpecifics: normalizeItemSpecifics(identification.itemSpecifics),
+    descriptionBullets: identification.descriptionBullets,
+    imageUrls: [],
     input: {
       notes,
       requestedCondition,
@@ -163,11 +197,14 @@ async function createDraft(request, env) {
     }
   };
 
-  await env.DRAFT_KV.put(draftId, JSON.stringify(draft), {
-    metadata: { status: draft.status, createdAt: now }
+  return await validateCategoryAndAspects({
+    draft,
+    token: ebayToken,
+    env,
+    saveDraft: true,
+    successStatus: "draft",
+    successHttpStatus: 201
   });
-
-  return jsonResponse(draft, 201);
 }
 
 async function getDraft(url, env) {
@@ -188,6 +225,8 @@ async function getDraft(url, env) {
 
 async function approveDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
+  requireSecret(env, "EBAY_CLIENT_ID");
+  requireSecret(env, "EBAY_CLIENT_SECRET");
 
   let body;
   try {
@@ -206,18 +245,108 @@ async function approveDraft(request, env) {
     return jsonResponse({ error: "draft_not_found" }, 404);
   }
 
-  const approvedDraft = {
+  const manualSpecifics = normalizeItemSpecifics(body?.itemSpecifics);
+  const updatedDraft = {
     ...draft,
-    status: "ready_to_publish_later",
+    itemSpecifics: mergeItemSpecifics(draft.itemSpecifics || draft.identification?.itemSpecifics || [], manualSpecifics),
+    updatedAt: new Date().toISOString()
+  };
+
+  if (typeof body?.categoryId === "string" && body.categoryId.trim()) {
+    updatedDraft.categoryId = body.categoryId.trim();
+    updatedDraft.categorySelectionSource = "manual_override";
+    if (draft.categoryId !== updatedDraft.categoryId) {
+      updatedDraft.categoryName = "";
+      updatedDraft.categoryTreeNodeAncestors = [];
+      updatedDraft.categoryConfidence = null;
+    }
+  }
+
+  const ebayToken = await getEbayToken(env);
+  return await validateCategoryAndAspects({
+    draft: updatedDraft,
+    token: ebayToken,
+    env,
+    saveDraft: true,
+    successStatus: "ready_to_publish_later",
+    successHttpStatus: 200
+  });
+}
+
+async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus }) {
+  const categoryQuery = buildCategoryQuery(draft);
+  let categoryId = draft.categoryId || "";
+
+  if (!categoryId) {
+    const categorySuggestion = await getCategorySuggestion(categoryQuery, token, env);
+    if (!categorySuggestion) {
+      const missingCategoryDraft = {
+        ...draft,
+        status: "category_required",
+        categoryQuery,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (saveDraft) {
+        await saveDraftToKv(env, missingCategoryDraft);
+      }
+
+      return jsonResponse({
+        error: "category_required",
+        message: "No eBay category could be determined.",
+        query: categoryQuery,
+        draft: missingCategoryDraft
+      }, 422);
+    }
+
+    draft = {
+      ...draft,
+      categoryId: categorySuggestion.categoryId,
+      categoryName: categorySuggestion.categoryName,
+      categoryTreeNodeAncestors: categorySuggestion.categoryTreeNodeAncestors,
+      categoryConfidence: categorySuggestion.categoryConfidence,
+      categorySelectionSource: "ebay_taxonomy_suggestion",
+      categoryQuery
+    };
+    categoryId = categorySuggestion.categoryId;
+  }
+
+  const aspectMetadata = await getCategoryAspects(categoryId, token, env);
+  const aspectResult = buildAspectsForEbay(draft, aspectMetadata);
+  const validatedDraft = {
+    ...draft,
+    status: aspectResult.missingRequiredAspects.length > 0
+      ? "missing_required_item_specifics"
+      : successStatus,
+    requiredAspects: aspectResult.requiredAspects,
+    recommendedAspects: aspectResult.recommendedAspects,
+    missingRequiredAspects: aspectResult.missingRequiredAspects,
+    itemSpecifics: aspectResult.itemSpecifics,
+    ebayAspects: aspectResult.aspects,
+    ebayInventoryItemDraft: aspectResult.missingRequiredAspects.length > 0
+      ? null
+      : buildEbayInventoryItemDraft(draft, aspectResult.aspects),
     publishEnabled: false,
     updatedAt: new Date().toISOString()
   };
 
-  await env.DRAFT_KV.put(draftId, JSON.stringify(approvedDraft), {
-    metadata: { status: approvedDraft.status, createdAt: approvedDraft.createdAt }
-  });
+  if (saveDraft) {
+    await saveDraftToKv(env, validatedDraft);
+  }
 
-  return jsonResponse(approvedDraft);
+  if (aspectResult.missingRequiredAspects.length > 0) {
+    return jsonResponse({
+      error: "missing_required_item_specifics",
+      categoryId: validatedDraft.categoryId,
+      categoryName: validatedDraft.categoryName,
+      missingRequiredAspects: aspectResult.missingRequiredAspects,
+      requiredAspects: aspectResult.requiredAspects,
+      recommendedAspects: aspectResult.recommendedAspects,
+      draft: validatedDraft
+    }, 422);
+  }
+
+  return jsonResponse(validatedDraft, successHttpStatus);
 }
 
 async function identifyItemWithOpenAI(apiKey, imageParts, input) {
@@ -302,10 +431,7 @@ async function searchEbayComps(env, token, query) {
   url.searchParams.set("filter", "buyingOptions:{FIXED_PRICE}");
 
   const response = await fetch(url, {
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "X-EBAY-C-MARKETPLACE-ID": env.EBAY_MARKETPLACE_ID || "EBAY_US"
-    }
+    headers: getEbayHeaders(token, env)
   });
 
   const payload = await parseJsonResponse(response, "eBay Browse");
@@ -323,6 +449,163 @@ async function searchEbayComps(env, token, query) {
       imageUrl: item.image?.imageUrl || ""
     }))
     .filter((item) => typeof item.price === "number" && Number.isFinite(item.price));
+}
+
+async function getCategorySuggestion(query, token, env) {
+  if (!query) {
+    return null;
+  }
+
+  const url = new URL(`${EBAY_TAXONOMY_TREE_URL}/get_category_suggestions`);
+  url.searchParams.set("q", query);
+
+  const response = await fetch(url, {
+    headers: getEbayHeaders(token, env)
+  });
+
+  if (response.status === 204) {
+    return null;
+  }
+
+  const payload = await parseJsonResponse(response, "eBay Taxonomy category suggestions");
+  const suggestions = Array.isArray(payload.categorySuggestions) ? payload.categorySuggestions : [];
+  const suggestion = suggestions[0];
+
+  if (!suggestion?.category?.categoryId) {
+    return null;
+  }
+
+  return {
+    categoryId: String(suggestion.category.categoryId),
+    categoryName: suggestion.category.categoryName || "",
+    categoryTreeNodeAncestors: Array.isArray(suggestion.categoryTreeNodeAncestors)
+      ? suggestion.categoryTreeNodeAncestors
+      : [],
+    categoryConfidence: suggestion.categoryConfidence ?? suggestion.relevancy ?? null
+  };
+}
+
+async function getCategoryAspects(categoryId, token, env) {
+  const url = new URL(`${EBAY_TAXONOMY_TREE_URL}/get_item_aspects_for_category`);
+  url.searchParams.set("category_id", categoryId);
+
+  const response = await fetch(url, {
+    headers: getEbayHeaders(token, env)
+  });
+
+  const payload = await parseJsonResponse(response, "eBay Taxonomy category aspects");
+  return Array.isArray(payload.aspects) ? payload.aspects : [];
+}
+
+function buildAspectsForEbay(draft, aspectMetadata) {
+  const requiredAspects = [];
+  const recommendedAspects = [];
+  const exactAspectNames = new Map();
+
+  for (const aspect of aspectMetadata) {
+    const name = stringValue(aspect.localizedAspectName);
+    if (!name) {
+      continue;
+    }
+
+    exactAspectNames.set(aspectKey(name), name);
+    const summary = summarizeAspect(aspect);
+
+    if (isRequiredAspect(aspect)) {
+      requiredAspects.push(summary);
+    } else if (isRecommendedAspect(aspect)) {
+      recommendedAspects.push(summary);
+    }
+  }
+
+  const merged = {};
+  const addAspect = (name, value, overwrite = true) => {
+    const values = normalizeAspectValues(value);
+    if (values.length === 0) {
+      return;
+    }
+
+    const normalized = normalizeAspectName(name);
+    const exactName = exactAspectNames.get(aspectKey(normalized)) || normalized;
+    if (!exactName) {
+      return;
+    }
+
+    if (!overwrite && merged[exactName]?.length > 0) {
+      return;
+    }
+
+    merged[exactName] = values;
+  };
+
+  for (const specific of normalizeItemSpecifics(draft.itemSpecifics || draft.identification?.itemSpecifics || [])) {
+    addAspect(specific.name, specific.value);
+  }
+
+  addAspect("Brand", draft.brand || draft.identification?.brand, false);
+  addAspect("MPN", draft.mpn || draft.identification?.mpn, false);
+  addAspect("Model", draft.model || draft.identification?.model, false);
+
+  if (exactAspectNames.has(aspectKey("Condition"))) {
+    addAspect("Condition", draft.condition || draft.identification?.condition, false);
+  }
+
+  const aspects = formatAspectsForEbay(merged);
+  const missingRequiredAspects = getMissingRequiredAspects(requiredAspects, aspects);
+
+  return {
+    aspects,
+    itemSpecifics: itemSpecificsFromAspects(aspects),
+    requiredAspects,
+    recommendedAspects,
+    missingRequiredAspects
+  };
+}
+
+function normalizeAspectName(name) {
+  const cleaned = stringValue(name).replace(/\s+/g, " ");
+  const compact = cleaned.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  if (compact === "brand") {
+    return "Brand";
+  }
+
+  if (compact === "mpn" || compact === "mfrpartnumber" || compact === "manufacturerpartnumber") {
+    return "MPN";
+  }
+
+  if (compact === "model") {
+    return "Model";
+  }
+
+  return cleaned;
+}
+
+function formatAspectsForEbay(aspects) {
+  const formatted = {};
+
+  for (const [name, value] of Object.entries(aspects || {})) {
+    const normalizedName = stringValue(name).replace(/\s+/g, " ");
+    const values = normalizeAspectValues(value);
+    if (normalizedName && values.length > 0) {
+      formatted[normalizedName] = values;
+    }
+  }
+
+  return formatted;
+}
+
+function getMissingRequiredAspects(requiredAspects, mergedAspects) {
+  const mergedByKey = new Map(
+    Object.entries(mergedAspects || {}).map(([name, values]) => [aspectKey(name), normalizeAspectValues(values)])
+  );
+
+  return requiredAspects
+    .filter((aspect) => {
+      const values = mergedByKey.get(aspectKey(aspect.name));
+      return !values || values.length === 0;
+    })
+    .map((aspect) => aspect.name);
 }
 
 function calculateSuggestedPrice(comps) {
@@ -344,28 +627,37 @@ function calculateSuggestedPrice(comps) {
 }
 
 function buildEbaySearchQuery(identification) {
-  const parts = [
+  return dedupeWords([
     identification.brand,
     identification.model,
     identification.mpn,
     identification.title
-  ];
+  ], 12);
+}
 
-  const seen = new Set();
-  return parts
-    .flatMap((part) => String(part || "").split(/\s+/))
-    .map((part) => part.replace(/[^\w.-]/g, "").trim())
-    .filter(Boolean)
-    .filter((part) => {
-      const key = part.toLowerCase();
-      if (seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 12)
-    .join(" ");
+function buildCategoryQuery(draft) {
+  return dedupeWords([
+    draft.title || draft.identification?.title,
+    draft.brand || draft.identification?.brand,
+    draft.model || draft.identification?.model,
+    draft.mpn || draft.identification?.mpn,
+    draft.categoryHint || draft.identification?.categoryHint
+  ], 16);
+}
+
+function buildEbayInventoryItemDraft(draft, aspects) {
+  return {
+    product: {
+      title: draft.title || draft.identification?.title || "",
+      description: buildDescription(draft),
+      brand: draft.brand || draft.identification?.brand || "",
+      mpn: draft.mpn || draft.identification?.mpn || "",
+      aspects: formatAspectsForEbay(aspects),
+      imageUrls: Array.isArray(draft.imageUrls)
+        ? draft.imageUrls.map(stringValue).filter(Boolean)
+        : []
+    }
+  };
 }
 
 async function fileToOpenAIImagePart(file) {
@@ -429,8 +721,7 @@ async function parseJsonResponse(response, serviceName) {
   }
 
   if (!response.ok) {
-    const message = payload.error?.message || payload.error_description || payload.message || `${serviceName} request failed.`;
-    throw new Error(`${serviceName} error (${response.status}): ${message}`);
+    throw new ExternalApiError(serviceName, response.status, payload);
   }
 
   return payload;
@@ -448,16 +739,146 @@ function normalizeIdentification(value) {
     mpn: stringValue(value.mpn),
     condition: stringValue(value.condition),
     categoryHint: stringValue(value.categoryHint),
-    itemSpecifics: Array.isArray(value.itemSpecifics)
-      ? value.itemSpecifics.map((specific) => ({
-        name: stringValue(specific?.name),
-        value: stringValue(specific?.value)
-      })).filter((specific) => specific.name || specific.value)
-      : [],
+    itemSpecifics: normalizeItemSpecifics(value.itemSpecifics),
     descriptionBullets: Array.isArray(value.descriptionBullets)
       ? value.descriptionBullets.map(stringValue).filter(Boolean)
       : [],
     confidence: clampNumber(value.confidence, 0, 1)
+  };
+}
+
+function normalizeItemSpecifics(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((specific) => ({
+        name: normalizeAspectName(specific?.name),
+        value: normalizeAspectValues(specific?.value).join(", ")
+      }))
+      .filter((specific) => specific.name && specific.value);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value)
+      .map(([name, itemValue]) => ({
+        name: normalizeAspectName(name),
+        value: normalizeAspectValues(itemValue).join(", ")
+      }))
+      .filter((specific) => specific.name && specific.value);
+  }
+
+  return [];
+}
+
+function mergeItemSpecifics(baseSpecifics, overrideSpecifics) {
+  const merged = new Map();
+
+  for (const specific of normalizeItemSpecifics(baseSpecifics)) {
+    merged.set(aspectKey(specific.name), specific);
+  }
+
+  for (const specific of normalizeItemSpecifics(overrideSpecifics)) {
+    merged.set(aspectKey(specific.name), specific);
+  }
+
+  return Array.from(merged.values());
+}
+
+function itemSpecificsFromAspects(aspects) {
+  return Object.entries(aspects || {}).map(([name, values]) => ({
+    name,
+    value: normalizeAspectValues(values).join(", ")
+  }));
+}
+
+function summarizeAspect(aspect) {
+  const constraint = aspect.aspectConstraint || {};
+  const values = Array.isArray(aspect.aspectValues) ? aspect.aspectValues : [];
+
+  return {
+    name: stringValue(aspect.localizedAspectName),
+    required: isRequiredAspect(aspect),
+    usage: constraint.aspectUsage || "",
+    cardinality: constraint.itemToAspectCardinality || "",
+    mode: constraint.aspectMode || "",
+    dataType: constraint.aspectDataType || "",
+    expectedRequiredByDate: constraint.expectedRequiredByDate || "",
+    allowedValueCount: values.length,
+    allowedValuesSample: values
+      .map((value) => stringValue(value.localizedValue))
+      .filter(Boolean)
+      .slice(0, 25)
+  };
+}
+
+function isRequiredAspect(aspect) {
+  const constraint = aspect.aspectConstraint || {};
+  const usage = String(constraint.aspectUsage || "").toUpperCase();
+  const cardinality = String(constraint.itemToAspectCardinality || "").toUpperCase();
+
+  return constraint.aspectRequired === true
+    || usage === "REQUIRED"
+    || cardinality.includes("REQUIRED");
+}
+
+function isRecommendedAspect(aspect) {
+  const constraint = aspect.aspectConstraint || {};
+  return String(constraint.aspectUsage || "").toUpperCase() === "RECOMMENDED"
+    || Boolean(constraint.expectedRequiredByDate);
+}
+
+function normalizeAspectValues(value) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return values
+    .flatMap((item) => typeof item === "string" ? item.split(",") : [item])
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+}
+
+function aspectKey(name) {
+  return normalizeAspectName(name).toLowerCase();
+}
+
+function dedupeWords(parts, limit) {
+  const seen = new Set();
+
+  return parts
+    .flatMap((part) => String(part || "").split(/\s+/))
+    .map((part) => part.replace(/[^\w.-]/g, "").trim())
+    .filter(Boolean)
+    .filter((part) => {
+      const key = part.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .join(" ");
+}
+
+function buildDescription(draft) {
+  const bullets = Array.isArray(draft.descriptionBullets)
+    ? draft.descriptionBullets
+    : draft.identification?.descriptionBullets || [];
+
+  return bullets
+    .map((bullet) => `- ${stringValue(bullet)}`)
+    .filter((bullet) => bullet.length > 2)
+    .join("\n");
+}
+
+async function saveDraftToKv(env, draft) {
+  await env.DRAFT_KV.put(draft.id, JSON.stringify(draft), {
+    metadata: { status: draft.status, createdAt: draft.createdAt }
+  });
+}
+
+function getEbayHeaders(token, env) {
+  return {
+    "Authorization": `Bearer ${token}`,
+    "X-EBAY-C-MARKETPLACE-ID": env.EBAY_MARKETPLACE_ID || "EBAY_US"
   };
 }
 
