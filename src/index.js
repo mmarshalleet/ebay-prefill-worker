@@ -150,21 +150,50 @@ async function createDraft(request, env) {
   const requestedCondition = stringField(formData, "condition");
   const ocrText = stringField(formData, "ocrText");
   const quantity = positiveIntegerField(formData, "quantity", 1);
+  const priceMode = parsePriceMode(stringField(formData, "priceMode"));
+  const cost = optionalNumberField(formData, "cost");
+  const desiredMarginPercent = optionalNumberField(formData, "desiredMarginPercent");
   const images = await Promise.all(imageFiles.map(fileToOpenAIImagePart));
 
-  const identification = await identifyItemWithOpenAI(env.OPENAI_API_KEY, images, {
+  let identification;
+  try {
+    identification = await identifyItemWithOpenAI(env.OPENAI_API_KEY, images, {
+      notes,
+      condition: requestedCondition,
+      quantity,
+      ocrText
+    });
+  } catch (error) {
+    if (error instanceof ExternalApiError) {
+      return jsonResponse({
+        error: "openai_identification_failed",
+        service: error.service,
+        status: error.status,
+        message: error.message,
+        raw: error.payload
+      }, 502);
+    }
+
+    return jsonResponse({
+      error: "openai_identification_failed",
+      message: error instanceof Error ? error.message : "OpenAI identification failed."
+    }, 502);
+  }
+
+  identification = enrichIdentificationWithExtractedPartNumbers(identification, {
     notes,
-    condition: requestedCondition,
-    quantity,
     ocrText
   });
 
-  const searchQuery = buildEbaySearchQuery(identification, ocrText);
   const ebayToken = await getEbayToken(env);
-  const comps = await searchEbayComps(env, ebayToken, searchQuery);
-  const suggestedPrice = calculateSuggestedPrice(comps);
   const draftId = crypto.randomUUID();
   const now = new Date().toISOString();
+  const pricingInputs = {
+    priceMode,
+    cost,
+    desiredMarginPercent,
+    ocrText
+  };
   const draft = {
     id: draftId,
     status: "draft",
@@ -178,6 +207,7 @@ async function createDraft(request, env) {
     condition: identification.condition,
     categoryHint: identification.categoryHint,
     ocrText,
+    extractedPartNumbers: identification.extractedPartNumbers,
     itemSpecifics: normalizeItemSpecifics(identification.itemSpecifics),
     descriptionBullets: identification.descriptionBullets,
     imageUrls: [],
@@ -186,18 +216,19 @@ async function createDraft(request, env) {
       requestedCondition,
       ocrText,
       quantity,
+      priceMode,
+      cost,
+      desiredMarginPercent,
       imageCount: imageFiles.length
     },
+    pricingInputs,
     identification,
     ebaySearch: {
       marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
-      query: searchQuery,
-      activeFixedPriceComps: comps,
-      compCount: comps.length
-    },
-    pricing: {
-      strategy: "median_active_fixed_price_comps_x_0.95",
-      suggestedPrice
+      query: "",
+      queries: [],
+      activeFixedPriceComps: [],
+      compCount: 0
     }
   };
 
@@ -207,7 +238,14 @@ async function createDraft(request, env) {
     env,
     saveDraft: true,
     successStatus: "draft",
-    successHttpStatus: 201
+    successHttpStatus: 201,
+    enrichDraft: async (validatedDraft) => addPricingToDraft(validatedDraft, {
+      env,
+      token: ebayToken,
+      priceMode,
+      cost,
+      desiredMarginPercent
+    })
   });
 }
 
@@ -277,19 +315,23 @@ async function approveDraft(request, env) {
   });
 }
 
-async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus }) {
+async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus, enrichDraft }) {
   const categoryQuery = buildCategoryQuery(draft);
   let categoryId = draft.categoryId || "";
 
   if (!categoryId) {
     const categorySuggestion = await getCategorySuggestion(categoryQuery, token, env);
     if (!categorySuggestion) {
-      const missingCategoryDraft = {
+      let missingCategoryDraft = {
         ...draft,
         status: "category_required",
         categoryQuery,
         updatedAt: new Date().toISOString()
       };
+
+      if (typeof enrichDraft === "function") {
+        missingCategoryDraft = await enrichDraft(missingCategoryDraft);
+      }
 
       if (saveDraft) {
         await saveDraftToKv(env, missingCategoryDraft);
@@ -317,7 +359,7 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
 
   const aspectMetadata = await getCategoryAspects(categoryId, token, env);
   const aspectResult = buildAspectsForEbay(draft, aspectMetadata);
-  const validatedDraft = {
+  let validatedDraft = {
     ...draft,
     status: aspectResult.missingRequiredAspects.length > 0
       ? "missing_required_item_specifics"
@@ -333,6 +375,10 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
     publishEnabled: false,
     updatedAt: new Date().toISOString()
   };
+
+  if (typeof enrichDraft === "function") {
+    validatedDraft = await enrichDraft(validatedDraft);
+  }
 
   if (saveDraft) {
     await saveDraftToKv(env, validatedDraft);
@@ -429,14 +475,103 @@ async function getEbayToken(env) {
   return payload.access_token;
 }
 
-async function searchEbayComps(env, token, query) {
+async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMarginPercent }) {
+  const pricingWarnings = [];
+  let activeComps = [];
+  let soldComps = [];
+  const searchCandidates = buildEbaySearchCandidates(draft);
+
+  try {
+    activeComps = await getActiveCompsFromEbay({ env, token, draft, searchCandidates });
+  } catch (error) {
+    pricingWarnings.push(formatWarning("eBay Browse pricing search failed", error));
+  }
+
+  try {
+    const soldResult = await collectSoldCompsFromSerpApi(draft, env);
+    soldComps = soldResult.comps;
+    pricingWarnings.push(...soldResult.warnings);
+  } catch (error) {
+    pricingWarnings.push(formatWarning("SerpAPI sold comp search failed", error));
+  }
+
+  const pricing = calculateSuggestedPrice({
+    draft,
+    activeComps,
+    soldComps,
+    priceMode,
+    cost,
+    desiredMarginPercent,
+    pricingWarnings
+  });
+  const activeAccepted = activeComps.filter((comp) => !comp.rejectReason);
+  const pricedDraft = {
+    ...draft,
+    suggestedPrice: pricing.suggestedPrice,
+    pricing,
+    ebaySearch: {
+      ...(draft.ebaySearch || {}),
+      marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
+      query: searchCandidates[0] || "",
+      queries: searchCandidates,
+      activeFixedPriceComps: activeAccepted,
+      compCount: activeAccepted.length
+    },
+    updatedAt: new Date().toISOString()
+  };
+
+  if (pricedDraft.ebayInventoryItemDraft && pricedDraft.ebayAspects) {
+    pricedDraft.ebayInventoryItemDraft = buildEbayInventoryItemDraft(pricedDraft, pricedDraft.ebayAspects);
+  }
+
+  return pricedDraft;
+}
+
+async function getActiveCompsFromEbay({ env, token, draft, searchCandidates }) {
+  const compsByKey = new Map();
+
+  for (const query of searchCandidates) {
+    const comps = await searchEbayComps(env, token, query, draft);
+    for (const comp of comps) {
+      const key = comp.itemId || comp.url || `${comp.title}:${comp.totalPrice}`;
+      if (!compsByKey.has(key)) {
+        compsByKey.set(key, comp);
+      }
+    }
+  }
+
+  return Array.from(compsByKey.values())
+    .sort((a, b) => b.matchScore - a.matchScore);
+}
+
+function buildEbaySearchCandidates(draft) {
+  const mpn = firstNonEmpty([
+    draft.mpn,
+    draft.identification?.mpn,
+    ...extractPartNumbers(draft.mpn || "")
+  ]);
+  const brand = firstNonEmpty([draft.brand, draft.identification?.brand]);
+  const model = firstNonEmpty([draft.model, draft.identification?.model]);
+  const title = firstNonEmpty([draft.title, draft.identification?.title]);
+  const ocrPartNumbers = extractPartNumbers(draft.ocrText || draft.input?.ocrText || "");
+
+  return uniqueNonEmpty([
+    mpn && brand ? dedupeWords([mpn, brand], 8) : "",
+    mpn,
+    model && brand ? dedupeWords([model, brand], 8) : "",
+    title,
+    ...ocrPartNumbers
+  ]).slice(0, 8);
+}
+
+async function searchEbayComps(env, token, query, draft) {
   if (!query) {
     return [];
   }
 
   const url = new URL(EBAY_BROWSE_SEARCH_URL);
   url.searchParams.set("q", query);
-  url.searchParams.set("limit", "20");
+  url.searchParams.set("limit", "50");
   url.searchParams.set("filter", "buyingOptions:{FIXED_PRICE}");
 
   const response = await fetch(url, {
@@ -447,17 +582,73 @@ async function searchEbayComps(env, token, query) {
   const summaries = Array.isArray(payload.itemSummaries) ? payload.itemSummaries : [];
 
   return summaries
-    .map((item) => ({
-      title: item.title || "",
-      itemWebUrl: item.itemWebUrl || "",
-      itemId: item.itemId || "",
-      condition: item.condition || "",
-      price: priceFromEbayValue(item.price),
-      currency: item.price?.currency || "",
-      sellerUsername: item.seller?.username || "",
-      imageUrl: item.image?.imageUrl || ""
-    }))
-    .filter((item) => typeof item.price === "number" && Number.isFinite(item.price));
+    .map((item) => normalizeEbayActiveComp(item, query, draft));
+}
+
+function normalizeEbayActiveComp(item, queryUsed, draft) {
+  const price = priceFromEbayValue(item.price);
+  const shippingCost = getShippingCost(item);
+  const totalPrice = typeof price === "number"
+    ? roundCurrency(price + (typeof shippingCost === "number" ? shippingCost : 0))
+    : null;
+  const categoryIds = getCategoryIdsFromItem(item);
+  const comp = {
+    source: "ebay_active",
+    title: item.title || "",
+    price,
+    currency: item.price?.currency || "",
+    shippingCost,
+    totalPrice,
+    url: item.itemWebUrl || "",
+    itemId: item.itemId || "",
+    condition: item.condition || "",
+    buyingOptions: Array.isArray(item.buyingOptions) ? item.buyingOptions : [],
+    sellerUsername: item.seller?.username || "",
+    image: item.image?.imageUrl || "",
+    categoryIds,
+    queryUsed,
+    matchScore: 0,
+    rejectReason: null
+  };
+
+  return {
+    ...comp,
+    ...scoreCompMatch(comp, draft)
+  };
+}
+
+function getShippingCost(item) {
+  const options = Array.isArray(item.shippingOptions) ? item.shippingOptions : [];
+  for (const option of options) {
+    const value = priceFromEbayValue(option.shippingCost);
+    if (typeof value === "number") {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function getCategoryIdsFromItem(item) {
+  const categoryIds = [];
+
+  if (item.categoryId) {
+    categoryIds.push(String(item.categoryId));
+  }
+
+  if (Array.isArray(item.categories)) {
+    for (const category of item.categories) {
+      if (category.categoryId) {
+        categoryIds.push(String(category.categoryId));
+      }
+    }
+  }
+
+  if (Array.isArray(item.leafCategoryIds)) {
+    categoryIds.push(...item.leafCategoryIds.map(String));
+  }
+
+  return uniqueNonEmpty(categoryIds);
 }
 
 async function getCategorySuggestion(query, token, env) {
@@ -617,22 +808,256 @@ function getMissingRequiredAspects(requiredAspects, mergedAspects) {
     .map((aspect) => aspect.name);
 }
 
-function calculateSuggestedPrice(comps) {
-  const prices = comps
-    .map((item) => item.price)
-    .filter((price) => typeof price === "number" && Number.isFinite(price) && price > 0)
-    .sort((a, b) => a - b);
-
-  if (prices.length === 0) {
-    return null;
+async function collectSoldCompsFromSerpApi(draft, env) {
+  if (!env.SERPAPI_KEY) {
+    return {
+      comps: [],
+      warnings: ["SERPAPI_KEY not configured; sold comps skipped."]
+    };
   }
 
-  const middle = Math.floor(prices.length / 2);
-  const median = prices.length % 2 === 0
-    ? (prices[middle - 1] + prices[middle]) / 2
-    : prices[middle];
+  const warnings = [];
+  const compsByKey = new Map();
+  const queries = buildSoldCompQueries(draft);
 
-  return roundCurrency(median * 0.95);
+  for (const query of queries) {
+    try {
+      const comps = await getSoldCompsFromSerpApi(query, env);
+      for (const comp of comps.map((item) => ({ ...item, ...scoreCompMatch(item, draft) }))) {
+        const key = comp.url || `${comp.title}:${comp.totalPrice}`;
+        if (!compsByKey.has(key)) {
+          compsByKey.set(key, comp);
+        }
+      }
+    } catch (error) {
+      warnings.push(formatWarning(`SerpAPI query failed: ${query}`, error));
+    }
+  }
+
+  return {
+    comps: Array.from(compsByKey.values()).sort((a, b) => b.matchScore - a.matchScore),
+    warnings
+  };
+}
+
+async function getSoldCompsFromSerpApi(query, env) {
+  const url = new URL("https://serpapi.com/search.json");
+  url.searchParams.set("engine", "google");
+  url.searchParams.set("q", query);
+  url.searchParams.set("api_key", env.SERPAPI_KEY);
+  url.searchParams.set("num", "10");
+
+  const response = await fetch(url);
+  const payload = await parseJsonResponse(response, "SerpAPI");
+  const organicResults = Array.isArray(payload.organic_results) ? payload.organic_results : [];
+
+  return organicResults.map((result) => {
+    const text = `${result.title || ""} ${result.snippet || ""}`;
+    const price = parsePriceFromText(text);
+
+    return {
+      source: "serpapi_sold",
+      title: result.title || "",
+      price,
+      totalPrice: price,
+      url: result.link || "",
+      snippet: result.snippet || "",
+      dateSold: parseSoldDate(result.snippet || ""),
+      queryUsed: query,
+      matchScore: 0,
+      rejectReason: null
+    };
+  });
+}
+
+function buildSoldCompQueries(draft) {
+  const mpn = firstNonEmpty([draft.mpn, draft.identification?.mpn, ...getDraftPartNumbers(draft)]);
+  const brand = firstNonEmpty([draft.brand, draft.identification?.brand]);
+
+  return uniqueNonEmpty([
+    mpn ? `"${mpn}" site:ebay.com/itm sold completed` : "",
+    mpn && brand ? `"${brand}" "${mpn}" site:ebay.com/itm sold` : "",
+    mpn ? `"${mpn}" "Sold" "Completed" eBay` : ""
+  ]);
+}
+
+function scoreCompMatch(comp, draft) {
+  const title = stringValue(comp.title);
+  const titleLower = title.toLowerCase();
+  const draftMpn = firstNonEmpty([draft.mpn, draft.identification?.mpn]);
+  const draftModel = firstNonEmpty([draft.model, draft.identification?.model]);
+  const draftBrand = firstNonEmpty([draft.brand, draft.identification?.brand]);
+  const draftCondition = draft.input?.requestedCondition || draft.condition || draft.identification?.condition;
+  const draftParts = getDraftPartNumbers(draft);
+  const titleParts = extractPartNumbers(title);
+  let score = 0;
+  let rejectReason = null;
+
+  const hasMpn = draftMpn && includesIdentifier(title, draftMpn);
+  const hasModel = draftModel && includesIdentifier(title, draftModel);
+  const hasBrand = draftBrand && titleLower.includes(draftBrand.toLowerCase());
+  const hasCategory = draft.categoryId && Array.isArray(comp.categoryIds) && comp.categoryIds.includes(String(draft.categoryId));
+  const hasAnyPartMatch = draftParts.some((part) => includesIdentifier(title, part));
+
+  if (hasMpn) {
+    score += 50;
+  }
+  if (hasModel) {
+    score += 25;
+  }
+  if (hasBrand) {
+    score += 15;
+  }
+  if (hasCategory) {
+    score += 10;
+  }
+  if (isSimilarCondition(comp.condition, draftCondition)) {
+    score += 8;
+  }
+
+  const badKeyword = getBadKeyword(titleLower);
+  if (badKeyword) {
+    score -= badKeyword.penalty;
+    if (badKeyword.reject && !(badKeyword.reason === "untested" && normalizeCondition(draftCondition) === "untested")) {
+      rejectReason = badKeyword.reason;
+    }
+  }
+
+  if (!(typeof comp.totalPrice === "number" && Number.isFinite(comp.totalPrice)) || comp.totalPrice <= 0) {
+    rejectReason = "invalid_price";
+  }
+
+  if (comp.currency && comp.currency !== "USD") {
+    rejectReason = "non_usd_currency";
+  }
+
+  if (draftMpn && !hasMpn && !hasModel && !hasBrand && !hasAnyPartMatch) {
+    rejectReason = "no_identifier_match";
+  }
+
+  if (draftMpn && hasConflictingPartNumber(titleParts, draftParts)) {
+    rejectReason = "conflicting_part_number";
+  }
+
+  return {
+    matchScore: Math.max(0, Math.min(100, score)),
+    rejectReason
+  };
+}
+
+function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cost, desiredMarginPercent, pricingWarnings = [] }) {
+  const rescoredActive = activeComps.map((comp) => ({ ...comp, ...scoreCompMatch(comp, draft) }));
+  const rescoredSold = soldComps.map((comp) => ({ ...comp, ...scoreCompMatch(comp, draft) }));
+  const rejectedComps = [...rescoredActive, ...rescoredSold]
+    .filter((comp) => comp.rejectReason)
+    .map(trimCompForPricing);
+  const acceptedActive = rescoredActive.filter((comp) => !comp.rejectReason);
+  const acceptedSold = rescoredSold.filter((comp) => !comp.rejectReason);
+  const exactActiveComps = acceptedActive.filter((comp) => isExactComp(comp, draft));
+  const exactSoldComps = acceptedSold.filter((comp) => isExactComp(comp, draft));
+  const weakerActiveComps = acceptedActive.filter((comp) => !isExactComp(comp, draft));
+  const weakerSoldComps = acceptedSold.filter((comp) => !isExactComp(comp, draft));
+  const exactComps = [...exactSoldComps, ...exactActiveComps];
+  const pricingComps = exactComps.length > 0
+    ? exactComps
+    : [...weakerSoldComps, ...weakerActiveComps];
+  const acceptedComps = [...acceptedSold, ...acceptedActive]
+    .sort((a, b) => b.matchScore - a.matchScore)
+    .map(trimCompForPricing);
+  const warnings = [...pricingWarnings];
+  const mode = parsePriceMode(priceMode);
+
+  if (pricingComps.length === 0) {
+    warnings.push("No accepted comps remained after scoring and filtering.");
+    return {
+      mode,
+      suggestedPrice: null,
+      lowPrice: null,
+      medianPrice: null,
+      highPrice: null,
+      activeMedian: medianPrice(acceptedActive),
+      soldMedian: medianPrice(acceptedSold),
+      priceConfidence: 0,
+      pricingReason: "No reliable comps were available after filtering.",
+      pricingWarnings: warnings,
+      compCount: 0,
+      exactCompCount: 0,
+      activeCompCount: acceptedActive.length,
+      soldCompCount: acceptedSold.length,
+      scarcityAdjustment: 0,
+      conditionMultiplier: getConditionMultiplier(draft.input?.requestedCondition || draft.condition || draft.identification?.condition),
+      minimumMarginPrice: null,
+      acceptedComps,
+      rejectedComps
+    };
+  }
+
+  const weightedPrices = weightedCompPrices(pricingComps, exactComps.length > 0);
+  const prices = pricingComps.map((comp) => comp.totalPrice).filter(isPositiveNumber).sort((a, b) => a - b);
+  const lowPrice = roundCurrency(percentile(prices, 0.25));
+  const medianRaw = percentile(weightedPrices, 0.5);
+  const highPrice = roundCurrency(percentile(prices, 0.75));
+  const activeMedian = medianPrice(acceptedActive);
+  const soldMedian = medianPrice(acceptedSold);
+  const exactActiveCount = exactActiveComps.length;
+  const exactSoldCount = exactSoldComps.length;
+  const scarcityAdjustment = getScarcityAdjustment(exactActiveCount, exactSoldCount, acceptedActive.length);
+  const conditionMultiplier = getConditionMultiplier(draft.input?.requestedCondition || draft.condition || draft.identification?.condition);
+  let basePrice;
+
+  if (mode === "fast_sale") {
+    basePrice = medianRaw * 0.85;
+  } else if (mode === "market") {
+    basePrice = medianRaw * 0.98;
+  } else if (exactComps.length === 0) {
+    basePrice = medianRaw * 0.95;
+    warnings.push("No exact MPN/model comps found; premium mode used conservative pricing.");
+  } else {
+    basePrice = scarcityAdjustment > 0
+      ? highPrice * 1.10
+      : medianRaw * 1.15;
+  }
+
+  let suggestedRaw = basePrice * conditionMultiplier * (1 + scarcityAdjustment);
+  const minimumMarginPrice = calculateMinimumMarginPrice(cost, desiredMarginPercent);
+
+  if (minimumMarginPrice && suggestedRaw < minimumMarginPrice) {
+    suggestedRaw = minimumMarginPrice;
+    warnings.push("Suggested price was raised to satisfy the desired margin.");
+  }
+
+  const suggestedPrice = roundListingPrice(suggestedRaw);
+  const confidence = calculatePriceConfidence({
+    draft,
+    acceptedActive,
+    acceptedSold,
+    exactActiveComps,
+    exactSoldComps,
+    rejectedComps,
+    prices
+  });
+
+  return {
+    mode,
+    suggestedPrice,
+    lowPrice,
+    medianPrice: roundCurrency(medianRaw),
+    highPrice,
+    activeMedian,
+    soldMedian,
+    priceConfidence: confidence,
+    pricingReason: buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps }),
+    pricingWarnings: warnings,
+    compCount: acceptedActive.length + acceptedSold.length,
+    exactCompCount: exactComps.length,
+    activeCompCount: acceptedActive.length,
+    soldCompCount: acceptedSold.length,
+    scarcityAdjustment,
+    conditionMultiplier,
+    minimumMarginPrice,
+    acceptedComps,
+    rejectedComps
+  };
 }
 
 function buildEbaySearchQuery(identification, ocrText = "") {
@@ -641,55 +1066,443 @@ function buildEbaySearchQuery(identification, ocrText = "") {
     identification.model,
     identification.brand,
     identification.title,
-    ...extractOcrPartNumbers(ocrText)
+    ...extractPartNumbers(ocrText)
   ], 18);
 }
 
-function extractOcrPartNumbers(ocrText) {
-  const text = stringValue(ocrText);
-  if (!text) {
+function extractPartNumbers(text) {
+  const sourceText = stringValue(text);
+  if (!sourceText) {
     return [];
   }
 
   const candidates = [];
-  const labeledValuePattern = /\b(?:mpn|m\.?p\.?n\.?|model(?:\s*(?:no\.?|number|#))?|part(?:\s*(?:no\.?|number|#))?|p\/n|pn|catalog(?:\s*(?:no\.?|number|#))?|cat(?:\.|\s)*(?:no\.?|number|#)?|mfr(?:\s+part)?(?:\s*(?:no\.?|number|#))?|manufacturer\s+part(?:\s*(?:no\.?|number|#))?)\s*[:#-]?\s*([a-z0-9][a-z0-9._/-]{2,})/gi;
-  const genericPartPattern = /\b(?:[a-z0-9]{2,}(?:[-./][a-z0-9]{2,})+|(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*\d)[a-z0-9][a-z0-9-]{3,})\b/gi;
+  const labeledValuePattern = /\b(?:mpn|m\.?p\.?n\.?|model(?:\s*(?:no\.?|number|#))?|part(?:\s*(?:no\.?|number|#))?|p\/n|pn|catalog(?:\s*(?:no\.?|number|#))?|cat(?:\.|\s)*(?:no\.?|number|#)?|mfr(?:\s+part)?(?:\s*(?:no\.?|number|#))?|manufacturer\s+part(?:\s*(?:no\.?|number|#))?)\s*[:#-]?\s*([a-z0-9][a-z0-9._/\-\s]{2,})/gi;
+  const siemensPattern = /\b\d[a-z]{2}\d\s+\d{3}-[a-z0-9]{4,}-[a-z0-9]{3,}\b/gi;
+  const hyphenatedPattern = /\b[a-z0-9]{2,}(?:[-/][a-z0-9]{2,})+\b/gi;
+  const compactPattern = /\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{5,}\b/gi;
 
-  for (const line of text.split(/\r?\n/)) {
-    const hasPartLabel = /\b(?:mpn|m\.?p\.?n\.?|model|part|p\/n|pn|catalog|cat\.?|mfr|manufacturer\s+part)\b/i.test(line);
+  for (const line of sourceText.split(/\r?\n/)) {
     const hasSerialLabel = /\b(?:serial|s\/n|sn)\b/i.test(line);
+    const hasPartLabel = /\b(?:mpn|m\.?p\.?n\.?|model|part|p\/n|pn|catalog|cat\.?|mfr|manufacturer\s+part)\b/i.test(line);
 
     if (hasPartLabel) {
       for (const match of line.matchAll(labeledValuePattern)) {
-        candidates.push(cleanOcrPartNumber(match[1]));
+        candidates.push(cleanPartNumber(match[1]));
       }
+    }
+
+    if (hasSerialLabel && !hasPartLabel) {
       continue;
     }
 
-    if (hasSerialLabel) {
-      continue;
-    }
-
-    for (const match of line.matchAll(genericPartPattern)) {
-      candidates.push(cleanOcrPartNumber(match[0]));
+    for (const pattern of [siemensPattern, hyphenatedPattern, compactPattern]) {
+      for (const match of line.matchAll(pattern)) {
+        candidates.push(cleanPartNumber(match[0]));
+      }
     }
   }
 
   return uniqueNonEmpty(candidates)
     .filter((candidate) => !isLikelyMeasurement(candidate))
-    .slice(0, 8);
+    .slice(0, 12);
 }
 
-function cleanOcrPartNumber(value) {
+function cleanPartNumber(value) {
   return String(value || "")
     .trim()
     .replace(/^[#:\s]+/, "")
     .replace(/[),;:]+$/g, "")
-    .replace(/[^a-z0-9._/-]/gi, "");
+    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9._/\-\s]/gi, "");
 }
 
 function isLikelyMeasurement(value) {
   return /^\d+(?:\.\d+)?(?:v|vac|vdc|a|amp|amps|hz|w|kw|hp|ma|dc|ac)$/i.test(value);
+}
+
+function enrichIdentificationWithExtractedPartNumbers(identification, input) {
+  const extractedPartNumbers = extractPartNumbers([
+    identification.title,
+    identification.brand,
+    identification.model,
+    identification.mpn,
+    input.notes,
+    input.ocrText,
+    ...normalizeItemSpecifics(identification.itemSpecifics).map((specific) => `${specific.name} ${specific.value}`)
+  ].join("\n"));
+  const primaryPartNumber = extractedPartNumbers[0] || "";
+  const enriched = {
+    ...identification,
+    mpn: identification.mpn || primaryPartNumber,
+    model: identification.model || primaryPartNumber,
+    extractedPartNumbers
+  };
+  const specifics = normalizeItemSpecifics(identification.itemSpecifics);
+
+  if (primaryPartNumber && !specifics.some((specific) => aspectKey(specific.name) === aspectKey("MPN"))) {
+    specifics.push({ name: "MPN", value: primaryPartNumber });
+  }
+
+  if (primaryPartNumber && !specifics.some((specific) => aspectKey(specific.name) === aspectKey("Model"))) {
+    specifics.push({ name: "Model", value: primaryPartNumber });
+  }
+
+  enriched.itemSpecifics = specifics;
+  return enriched;
+}
+
+function getDraftPartNumbers(draft) {
+  return uniqueNonEmpty([
+    draft.mpn,
+    draft.model,
+    draft.identification?.mpn,
+    draft.identification?.model,
+    ...(Array.isArray(draft.extractedPartNumbers) ? draft.extractedPartNumbers : []),
+    ...extractPartNumbers(draft.ocrText || draft.input?.ocrText || ""),
+    ...extractPartNumbers(draft.title || draft.identification?.title || ""),
+    ...normalizeItemSpecifics(draft.itemSpecifics || draft.identification?.itemSpecifics || [])
+      .filter((specific) => ["mpn", "model", "manufacturer part number", "catalog number"].includes(specific.name.toLowerCase()))
+      .flatMap((specific) => extractPartNumbers(specific.value).concat(specific.value))
+  ]);
+}
+
+function normalizePartNumber(value) {
+  return stringValue(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function includesIdentifier(text, identifier) {
+  const normalizedText = normalizePartNumber(text);
+  const normalizedIdentifier = normalizePartNumber(identifier);
+  return Boolean(normalizedIdentifier) && normalizedText.includes(normalizedIdentifier);
+}
+
+function hasConflictingPartNumber(titleParts, draftParts) {
+  const normalizedDraftParts = draftParts.map(normalizePartNumber).filter(Boolean);
+  const normalizedTitleParts = titleParts.map(normalizePartNumber).filter((part) => part.length >= 5);
+
+  if (normalizedDraftParts.length === 0 || normalizedTitleParts.length === 0) {
+    return false;
+  }
+
+  const hasMatchingPart = normalizedTitleParts.some((part) =>
+    normalizedDraftParts.some((draftPart) => part === draftPart || part.includes(draftPart) || draftPart.includes(part))
+  );
+
+  return !hasMatchingPart;
+}
+
+function getBadKeyword(titleLower) {
+  const badKeywords = [
+    { pattern: /\bfor parts\b/, reason: "for_parts", penalty: 60, reject: true },
+    { pattern: /\brepair\b/, reason: "repair_item", penalty: 45, reject: true },
+    { pattern: /\bbroken\b/, reason: "broken_item", penalty: 60, reject: true },
+    { pattern: /\bas[-\s]?is\b/, reason: "as_is_item", penalty: 45, reject: true },
+    { pattern: /\bas is\b/, reason: "as_is_item", penalty: 45, reject: true },
+    { pattern: /\bnot working\b/, reason: "not_working", penalty: 60, reject: true },
+    { pattern: /\buntested\b/, reason: "untested", penalty: 25, reject: true },
+    { pattern: /\blot of\b/, reason: "lot_or_bundle", penalty: 35, reject: true },
+    { pattern: /\blot\s+\d*\b/, reason: "lot_or_bundle", penalty: 35, reject: true },
+    { pattern: /\bbundle\b/, reason: "bundle", penalty: 30, reject: true },
+    { pattern: /\bmanual\b/, reason: "manual_only", penalty: 55, reject: true },
+    { pattern: /\bbox only\b/, reason: "box_only", penalty: 60, reject: true },
+    { pattern: /\bempty box\b/, reason: "empty_box", penalty: 60, reject: true },
+    { pattern: /\bpower supply only\b/, reason: "partial_item", penalty: 60, reject: true },
+    { pattern: /\bcable only\b/, reason: "partial_item", penalty: 60, reject: true },
+    { pattern: /\bmount only\b/, reason: "partial_item", penalty: 60, reject: true }
+  ];
+
+  return badKeywords.find((entry) => entry.pattern.test(titleLower)) || null;
+}
+
+function isSimilarCondition(compCondition, draftCondition) {
+  const comp = normalizeCondition(compCondition);
+  const draft = normalizeCondition(draftCondition);
+  if (!comp || !draft) {
+    return false;
+  }
+  if (comp === draft) {
+    return true;
+  }
+  return (comp.startsWith("new") && draft.startsWith("new"))
+    || (comp.startsWith("used") && draft.startsWith("used"));
+}
+
+function normalizeCondition(condition) {
+  const value = stringValue(condition).toLowerCase();
+  if (!value) {
+    return "";
+  }
+  if (value.includes("for parts") || value.includes("not working")) {
+    return "for_parts";
+  }
+  if (value.includes("untested")) {
+    return "untested";
+  }
+  if (value.includes("sealed")) {
+    return "new_sealed";
+  }
+  if (value.includes("open box")) {
+    return "new_open_box";
+  }
+  if (value.includes("new other")) {
+    return "new_other";
+  }
+  if (value.includes("new")) {
+    return "new";
+  }
+  if (value.includes("tested")) {
+    return "used_tested";
+  }
+  if (value.includes("used")) {
+    return "used";
+  }
+  return value;
+}
+
+function isExactComp(comp, draft) {
+  const title = comp.title || "";
+  const draftMpn = firstNonEmpty([draft.mpn, draft.identification?.mpn]);
+  const draftModel = firstNonEmpty([draft.model, draft.identification?.model]);
+
+  return (draftMpn && includesIdentifier(title, draftMpn))
+    || (draftModel && includesIdentifier(title, draftModel))
+    || getDraftPartNumbers(draft).some((part) => includesIdentifier(title, part));
+}
+
+function weightedCompPrices(comps, exactOnly) {
+  const prices = [];
+
+  for (const comp of comps) {
+    if (!isPositiveNumber(comp.totalPrice)) {
+      continue;
+    }
+
+    const isSold = comp.source === "serpapi_sold";
+    const weight = exactOnly
+      ? (isSold ? 4 : 3)
+      : (isSold ? 2 : 1);
+
+    for (let index = 0; index < weight; index += 1) {
+      prices.push(comp.totalPrice);
+    }
+  }
+
+  return prices.sort((a, b) => a - b);
+}
+
+function medianPrice(comps) {
+  const prices = comps.map((comp) => comp.totalPrice).filter(isPositiveNumber).sort((a, b) => a - b);
+  if (prices.length === 0) {
+    return null;
+  }
+  return roundCurrency(percentile(prices, 0.5));
+}
+
+function percentile(sortedValues, percentileValue) {
+  if (sortedValues.length === 0) {
+    return null;
+  }
+  if (sortedValues.length === 1) {
+    return sortedValues[0];
+  }
+
+  const index = (sortedValues.length - 1) * percentileValue;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  const weight = index - lower;
+
+  return sortedValues[lower] * (1 - weight) + sortedValues[upper] * weight;
+}
+
+function getScarcityAdjustment(exactActiveCount, exactSoldCount, activeCount) {
+  if (exactActiveCount <= 2 && exactSoldCount >= 1) {
+    if (exactActiveCount === 0) {
+      return 0.25;
+    }
+    if (exactActiveCount === 1) {
+      return 0.18;
+    }
+    return 0.10;
+  }
+
+  if (activeCount >= 30) {
+    return -0.15;
+  }
+  if (activeCount >= 15) {
+    return -0.08;
+  }
+
+  return 0;
+}
+
+function getConditionMultiplier(condition) {
+  const normalized = normalizeCondition(condition);
+  if (normalized === "new_sealed") {
+    return 1.25;
+  }
+  if (normalized === "new_open_box" || normalized === "open_box") {
+    return 1.15;
+  }
+  if (normalized === "new_other" || normalized === "new") {
+    return 1.10;
+  }
+  if (normalized === "used_tested") {
+    return 1;
+  }
+  if (normalized === "used") {
+    return 0.95;
+  }
+  if (normalized === "untested") {
+    return 0.75;
+  }
+  if (normalized === "for_parts") {
+    return 0.40;
+  }
+  return 1;
+}
+
+function calculateMinimumMarginPrice(cost, desiredMarginPercent) {
+  if (!isPositiveNumber(cost) || !isPositiveNumber(desiredMarginPercent) || desiredMarginPercent >= 100) {
+    return null;
+  }
+
+  return roundCurrency(cost / (1 - desiredMarginPercent / 100));
+}
+
+function roundListingPrice(value) {
+  if (!isPositiveNumber(value)) {
+    return null;
+  }
+
+  if (value < 100) {
+    const floorTen = Math.floor(value / 10) * 10;
+    const candidates = [floorTen + 4.99, floorTen + 9.99, floorTen + 14.99]
+      .filter((candidate) => candidate >= value);
+    return roundCurrency(candidates[0] || Math.ceil(value));
+  }
+
+  if (value < 1000) {
+    return roundCurrency(Math.ceil((value + 0.01) / 10) * 10 - 0.01);
+  }
+
+  return Math.ceil((value + 1) / 25) * 25 - 1;
+}
+
+function calculatePriceConfidence({ draft, acceptedActive, acceptedSold, exactActiveComps, exactSoldComps, rejectedComps, prices }) {
+  let confidence = 0.35;
+  const sellers = new Set(acceptedActive.map((comp) => comp.sellerUsername).filter(Boolean));
+  const median = percentile(prices, 0.5);
+  const low = percentile(prices, 0.25);
+  const high = percentile(prices, 0.75);
+  const spread = median ? (high - low) / median : 1;
+
+  if (exactSoldComps.length > 0) {
+    confidence += 0.25;
+  }
+  if (exactActiveComps.length > 0) {
+    confidence += 0.20;
+  }
+  if (acceptedActive.length + acceptedSold.length >= 5) {
+    confidence += 0.10;
+  }
+  if (sellers.size >= 3) {
+    confidence += 0.05;
+  }
+  if ([...acceptedActive, ...acceptedSold].some((comp) => Array.isArray(comp.categoryIds) && comp.categoryIds.includes(String(draft.categoryId)))) {
+    confidence += 0.05;
+  }
+  if (spread < 0.30) {
+    confidence += 0.10;
+  }
+  if (spread > 0.80) {
+    confidence -= 0.15;
+  }
+  if (exactActiveComps.length + exactSoldComps.length === 0) {
+    confidence -= 0.15;
+  }
+  if (acceptedSold.length === 0 && acceptedActive.length > 0) {
+    confidence -= 0.10;
+  }
+  if (acceptedActive.length + acceptedSold.length < 3) {
+    confidence -= 0.15;
+  }
+  if ((draft.identification?.confidence ?? 1) < 0.5) {
+    confidence -= 0.10;
+  }
+  if (draft.categoryConfidence !== null && draft.categoryConfidence !== undefined && Number(draft.categoryConfidence) < 0.5) {
+    confidence -= 0.10;
+  }
+  if (rejectedComps.some((comp) => comp.rejectReason === "conflicting_part_number")) {
+    confidence -= 0.10;
+  }
+
+  return roundCurrency(Math.max(0, Math.min(1, confidence)));
+}
+
+function buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps }) {
+  const parts = [
+    `Suggested ${mode.replace("_", " ")} price based on ${exactActiveComps.length} exact active comps and ${exactSoldComps.length} sold comps.`
+  ];
+
+  if (scarcityAdjustment > 0) {
+    parts.push(`Scarcity adjustment applied because only ${exactActiveComps.length} exact active listing${exactActiveComps.length === 1 ? " was" : "s were"} found.`);
+  } else if (scarcityAdjustment < 0) {
+    parts.push(`High active supply adjustment applied because ${acceptedActive.length} active comps were found.`);
+  }
+
+  if (exactComps.length === 0) {
+    parts.push("No exact MPN/model comps were accepted, so pricing is conservative.");
+  }
+
+  return parts.join(" ");
+}
+
+function trimCompForPricing(comp) {
+  return {
+    source: comp.source,
+    title: comp.title,
+    price: comp.price,
+    currency: comp.currency,
+    shippingCost: comp.shippingCost ?? null,
+    totalPrice: comp.totalPrice,
+    url: comp.url,
+    condition: comp.condition || "",
+    buyingOptions: comp.buyingOptions || [],
+    sellerUsername: comp.sellerUsername || "",
+    image: comp.image || "",
+    categoryIds: comp.categoryIds || [],
+    snippet: comp.snippet || "",
+    dateSold: comp.dateSold || "",
+    queryUsed: comp.queryUsed || "",
+    matchScore: comp.matchScore,
+    rejectReason: comp.rejectReason
+  };
+}
+
+function parsePriceFromText(text) {
+  const match = stringValue(text).match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+  if (!match) {
+    return null;
+  }
+  const value = Number.parseFloat(match[1].replace(/,/g, ""));
+  return Number.isFinite(value) ? value : null;
+}
+
+function parseSoldDate(text) {
+  const match = stringValue(text).match(/\b(?:sold|ended|completed)(?:\s+on)?\s+([A-Z][a-z]{2,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+  return match ? match[1] : "";
+}
+
+function formatWarning(prefix, error) {
+  if (error instanceof ExternalApiError) {
+    return `${prefix}: ${error.message}`;
+  }
+  return `${prefix}: ${error instanceof Error ? error.message : "Unknown error"}`;
+}
+
+function isPositiveNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 function buildCategoryQuery(draft) {
@@ -703,7 +1516,8 @@ function buildCategoryQuery(draft) {
 }
 
 function buildEbayInventoryItemDraft(draft, aspects) {
-  return {
+  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice ?? null;
+  const inventoryDraft = {
     product: {
       title: draft.title || draft.identification?.title || "",
       description: buildDescription(draft),
@@ -715,6 +1529,19 @@ function buildEbayInventoryItemDraft(draft, aspects) {
         : []
     }
   };
+
+  if (isPositiveNumber(suggestedPrice)) {
+    inventoryDraft.offer = {
+      pricingSummary: {
+        price: {
+          value: String(suggestedPrice),
+          currency: "USD"
+        }
+      }
+    };
+  }
+
+  return inventoryDraft;
 }
 
 async function fileToOpenAIImagePart(file) {
@@ -964,6 +1791,25 @@ function stringField(formData, key) {
 function positiveIntegerField(formData, key, fallback) {
   const value = Number.parseInt(stringField(formData, key), 10);
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function optionalNumberField(formData, key) {
+  const rawValue = stringField(formData, key);
+  if (!rawValue) {
+    return null;
+  }
+
+  const value = Number.parseFloat(rawValue.replace(/[$,%\s]/g, ""));
+  return Number.isFinite(value) ? value : null;
+}
+
+function parsePriceMode(value) {
+  const mode = stringValue(value).toLowerCase();
+  return ["fast_sale", "market", "premium"].includes(mode) ? mode : "premium";
+}
+
+function firstNonEmpty(values) {
+  return values.map(stringValue).find(Boolean) || "";
 }
 
 function stringValue(value) {

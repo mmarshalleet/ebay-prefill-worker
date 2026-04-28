@@ -24,6 +24,9 @@ Optional form fields:
 - `condition`
 - `quantity`
 - `ocrText`: text recognized by the Shortcut or another OCR step from labels, plates, stickers, or packaging
+- `priceMode`: `fast_sale`, `market`, or `premium`; defaults to `premium`
+- `cost`
+- `desiredMarginPercent`
 
 The response includes:
 
@@ -31,7 +34,8 @@ The response includes:
 - saved OCR text, when provided
 - eBay search query
 - active fixed-price Browse API comps
-- suggested price calculated as `median active comps * 0.95`
+- optional sold comp signals from SerpAPI when `SERPAPI_KEY` is configured
+- suggested price from scored active comps, optional sold comps, condition, scarcity, price mode, and margin settings
 - automatic eBay category selection from the Taxonomy API
 - required and recommended item specifics for the selected category
 - missing required item specifics, if eBay requires values the photos did not provide
@@ -63,6 +67,36 @@ If required item specifics are missing, the Worker returns:
 ```
 
 The draft remains saved in KV so the missing values can be supplied later.
+
+The response also includes a pricing object:
+
+```json
+{
+  "pricing": {
+    "mode": "premium",
+    "suggestedPrice": 849.99,
+    "lowPrice": 699,
+    "medianPrice": 799,
+    "highPrice": 899,
+    "activeMedian": 799,
+    "soldMedian": 825,
+    "priceConfidence": 0.82,
+    "pricingReason": "Suggested premium price based on 3 exact active comps and 2 sold comps.",
+    "pricingWarnings": [],
+    "compCount": 5,
+    "exactCompCount": 5,
+    "activeCompCount": 3,
+    "soldCompCount": 2,
+    "scarcityAdjustment": 0.1,
+    "conditionMultiplier": 1.15,
+    "minimumMarginPrice": null,
+    "acceptedComps": [],
+    "rejectedComps": []
+  }
+}
+```
+
+The top-level `suggestedPrice` is kept for compatibility and matches `pricing.suggestedPrice`.
 
 ### `GET /draft?id=...`
 
@@ -137,6 +171,38 @@ It then merges AI-detected item specifics with `Brand`, `MPN`, `Model`, and manu
 
 This payload is only returned and saved as a draft. The Worker does not call `publishOffer` or any other eBay publishing API.
 
+## Pricing
+
+The Worker uses layered active eBay Browse API searches instead of a single comp query. Search attempts are made in this order:
+
+1. exact MPN plus brand
+2. exact MPN only
+3. model plus brand
+4. title
+5. likely part numbers extracted from OCR text
+
+Each active comp is normalized with item price, shipping when available, total price, condition, seller, category ids, query used, match score, and reject reason. The scorer favors exact MPN/model/brand/category matches and filters out likely wrong comps such as manuals, box-only listings, repair listings, bundles, lots, and conflicting part numbers. `open box` is allowed.
+
+`priceMode` controls the final price:
+
+- `fast_sale`: prices below the reliable median for faster movement.
+- `market`: prices close to the reliable median.
+- `premium`: defaults to a higher price, with scarcity upside when exact active comps are limited.
+
+Condition adjustments are applied after comp pricing:
+
+- New Sealed: +25%
+- New Open Box / Open Box: +15%
+- New other: +10%
+- Used Tested: baseline
+- Used: -5%
+- Untested: -25%
+- For parts/not working: -60%
+
+If `cost` and `desiredMarginPercent` are provided, the Worker calculates a minimum margin price and will not suggest a lower price. Final prices are rounded to eBay-style endings such as `189.99`, `849.99`, or `1299`.
+
+If `SERPAPI_KEY` is configured, the Worker also searches for sold/completed eBay result signals through SerpAPI. Sold exact comps are weighted highest, then exact active comps, then weaker sold and active comps. If SerpAPI is missing or fails, the draft still succeeds and the issue is recorded in `pricing.pricingWarnings`.
+
 ## Cloudflare Setup
 
 Install dependencies:
@@ -173,6 +239,12 @@ Add secrets:
 npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put EBAY_CLIENT_ID
 npx wrangler secret put EBAY_CLIENT_SECRET
+```
+
+Optional sold comp support:
+
+```bash
+npx wrangler secret put SERPAPI_KEY
 ```
 
 `EBAY_MARKETPLACE_ID` defaults to `EBAY_US` in `wrangler.toml`. Change it there if you need a different marketplace.
@@ -224,11 +296,24 @@ Create a Shortcut that:
 2. Sends a `POST` request to `https://your-worker.your-subdomain.workers.dev/draft`.
 3. Sets the request body to `Form`.
 4. Adds each selected photo under the form key `images`.
-5. Optionally adds text fields named `notes`, `condition`, `quantity`, and `ocrText`.
+5. Optionally adds text fields named `notes`, `condition`, `quantity`, `ocrText`, `priceMode`, `cost`, and `desiredMarginPercent`.
 6. Reads the JSON response and presents it for review.
 7. If the response contains `missingRequiredAspects`, asks for those values and sends them back to `/approve` as `itemSpecifics`.
 
 For better identification and comp search, add an OCR step in the Shortcut and pass recognized text as `ocrText`. The Worker tells OpenAI to treat OCR as a likely source for catalog numbers, MPNs, model numbers, manufacturer names, voltage, and part numbers, while ignoring obvious serial numbers unless they help identify the product family. The eBay comp search query is built from MPN, model, brand, title, and exact OCR-looking part numbers.
+
+Example Shortcut form fields:
+
+```text
+images: selected photos
+ocrText: Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16
+notes: Includes factory box
+condition: New Open Box
+quantity: 1
+priceMode: premium
+cost: 125
+desiredMarginPercent: 35
+```
 
 To approve a draft for later publishing, send JSON to `/approve`:
 
@@ -269,7 +354,10 @@ curl -X POST http://localhost:8787/draft \
   -F "notes=Includes box and charger" \
   -F "condition=Used" \
   -F "quantity=1" \
-  -F "ocrText=Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16"
+  -F "ocrText=Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16" \
+  -F "priceMode=premium" \
+  -F "cost=125" \
+  -F "desiredMarginPercent=35"
 ```
 
 Fetch a draft:
