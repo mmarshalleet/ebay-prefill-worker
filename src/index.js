@@ -14,6 +14,7 @@ const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token";
 const EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search";
 const EBAY_TAXONOMY_TREE_URL = "https://api.ebay.com/commerce/taxonomy/v1/category_tree/0";
+const EBAY_INVENTORY_URL = "https://api.ebay.com/sell/inventory/v1";
 const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope";
 
 const listingSchema = {
@@ -269,6 +270,7 @@ async function approveDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
   requireSecret(env, "EBAY_CLIENT_ID");
   requireSecret(env, "EBAY_CLIENT_SECRET");
+  requireSecret(env, "EBAY_TOKEN");
 
   let body;
   try {
@@ -311,11 +313,12 @@ async function approveDraft(request, env) {
     env,
     saveDraft: true,
     successStatus: "ready_to_publish_later",
-    successHttpStatus: 200
+    successHttpStatus: 200,
+    afterValidDraft: async (validatedDraft) => createUnpublishedEbayOfferDraft(validatedDraft, env)
   });
 }
 
-async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus, enrichDraft }) {
+async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus, enrichDraft, afterValidDraft }) {
   const categoryQuery = buildCategoryQuery(draft);
   let categoryId = draft.categoryId || "";
 
@@ -378,6 +381,10 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
 
   if (typeof enrichDraft === "function") {
     validatedDraft = await enrichDraft(validatedDraft);
+  }
+
+  if (aspectResult.missingRequiredAspects.length === 0 && typeof afterValidDraft === "function") {
+    validatedDraft = await afterValidDraft(validatedDraft);
   }
 
   if (saveDraft) {
@@ -473,6 +480,169 @@ async function getEbayToken(env) {
   }
 
   return payload.access_token;
+}
+
+async function createUnpublishedEbayOfferDraft(draft, env) {
+  if (draft.ebayOffer?.offerId) {
+    return {
+      ...draft,
+      status: "ebay_offer_draft_created",
+      publishEnabled: false,
+      ebayOffer: {
+        ...draft.ebayOffer,
+        reusedExistingOffer: true
+      },
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice ?? null;
+  if (!isPositiveNumber(suggestedPrice)) {
+    return {
+      ...draft,
+      status: "price_required_before_ebay_offer",
+      publishEnabled: false,
+      ebayOffer: null,
+      ebayOfferWarnings: ["No suggested price is available, so an eBay offer draft was not created."],
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const sku = draft.sku || buildSku(draft);
+  const inventoryItemPayload = buildEbayInventoryItemPayload(draft);
+  await putEbayInventoryItem({ sku, payload: inventoryItemPayload, env });
+
+  const offerPayload = buildEbayOfferPayload(draft, sku, suggestedPrice, env);
+  const offer = await createEbayOffer({ payload: offerPayload, env });
+
+  return {
+    ...draft,
+    sku,
+    status: "ebay_offer_draft_created",
+    publishEnabled: false,
+    ebayInventoryItem: {
+      sku,
+      createdOrUpdated: true,
+      payload: inventoryItemPayload
+    },
+    ebayOffer: {
+      offerId: offer.offerId || "",
+      status: "unpublished",
+      publishEnabled: false,
+      payload: offerPayload,
+      raw: offer
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function putEbayInventoryItem({ sku, payload, env }) {
+  const response = await fetch(`${EBAY_INVENTORY_URL}/inventory_item/${encodeURIComponent(sku)}`, {
+    method: "PUT",
+    headers: getEbaySellHeaders(env),
+    body: JSON.stringify(payload)
+  });
+
+  if (response.status === 204) {
+    return {};
+  }
+
+  return await parseJsonResponse(response, "eBay Inventory createOrReplaceInventoryItem");
+}
+
+async function createEbayOffer({ payload, env }) {
+  const response = await fetch(`${EBAY_INVENTORY_URL}/offer`, {
+    method: "POST",
+    headers: getEbaySellHeaders(env),
+    body: JSON.stringify(payload)
+  });
+
+  return await parseJsonResponse(response, "eBay Inventory createOffer");
+}
+
+function buildEbayInventoryItemPayload(draft) {
+  const quantity = getDraftQuantity(draft);
+  const product = {
+    title: truncateText(draft.title || draft.identification?.title || "", 80),
+    description: truncateText(buildDescription(draft) || draft.title || draft.identification?.title || "", 4000),
+    aspects: formatAspectsForEbay(draft.ebayAspects || {}),
+    imageUrls: normalizeImageUrls(draft.imageUrls)
+  };
+  const brand = draft.brand || draft.identification?.brand || "";
+  const mpn = draft.mpn || draft.identification?.mpn || "";
+
+  if (brand) {
+    product.brand = brand;
+  }
+
+  if (mpn) {
+    product.mpn = mpn;
+  }
+
+  if (product.imageUrls.length === 0) {
+    delete product.imageUrls;
+  }
+
+  return {
+    availability: {
+      shipToLocationAvailability: {
+        quantity
+      }
+    },
+    condition: mapEbayCondition(draft.input?.requestedCondition || draft.condition || draft.identification?.condition),
+    product
+  };
+}
+
+function buildEbayOfferPayload(draft, sku, suggestedPrice, env) {
+  const payload = {
+    sku,
+    marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
+    format: "FIXED_PRICE",
+    availableQuantity: getDraftQuantity(draft),
+    categoryId: String(draft.categoryId || ""),
+    listingDescription: truncateText(buildDescription(draft) || draft.title || draft.identification?.title || "", 4000),
+    pricingSummary: {
+      price: {
+        value: String(suggestedPrice),
+        currency: "USD"
+      }
+    },
+    includeCatalogProductDetails: true
+  };
+  const listingPolicies = buildListingPolicies(env);
+
+  if (listingPolicies) {
+    payload.listingPolicies = listingPolicies;
+  }
+
+  if (env.EBAY_MERCHANT_LOCATION_KEY) {
+    payload.merchantLocationKey = env.EBAY_MERCHANT_LOCATION_KEY;
+  }
+
+  return payload;
+}
+
+function buildListingPolicies(env) {
+  const listingPolicies = {};
+
+  if (env.EBAY_FULFILLMENT_POLICY_ID) {
+    listingPolicies.fulfillmentPolicyId = env.EBAY_FULFILLMENT_POLICY_ID;
+  }
+
+  if (env.EBAY_PAYMENT_POLICY_ID) {
+    listingPolicies.paymentPolicyId = env.EBAY_PAYMENT_POLICY_ID;
+  }
+
+  if (env.EBAY_RETURN_POLICY_ID) {
+    listingPolicies.returnPolicyId = env.EBAY_RETURN_POLICY_ID;
+  }
+
+  return Object.keys(listingPolicies).length > 0 ? listingPolicies : null;
+}
+
+function buildSku(draft) {
+  return truncateText(`draft-${draft.id}`, 50);
 }
 
 async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMarginPercent }) {
@@ -1783,6 +1953,52 @@ function getEbayHeaders(token, env) {
   };
 }
 
+function getEbaySellHeaders(env) {
+  return {
+    "Authorization": `Bearer ${env.EBAY_TOKEN}`,
+    "Content-Type": "application/json",
+    "Content-Language": env.EBAY_CONTENT_LANGUAGE || "en-US",
+    "X-EBAY-C-MARKETPLACE-ID": env.EBAY_MARKETPLACE_ID || "EBAY_US"
+  };
+}
+
+function getDraftQuantity(draft) {
+  const quantity = Number.parseInt(draft.input?.quantity ?? draft.quantity ?? 1, 10);
+  return Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
+}
+
+function mapEbayCondition(condition) {
+  const normalized = normalizeCondition(condition);
+
+  if (normalized === "new_sealed") {
+    return "NEW";
+  }
+
+  if (normalized === "new_open_box" || normalized === "new_other" || normalized === "new") {
+    return "NEW_OTHER";
+  }
+
+  if (normalized === "for_parts") {
+    return "FOR_PARTS_OR_NOT_WORKING";
+  }
+
+  if (normalized === "untested") {
+    return "USED_ACCEPTABLE";
+  }
+
+  return "USED_GOOD";
+}
+
+function normalizeImageUrls(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return uniqueNonEmpty(value)
+    .filter((url) => /^https:\/\//i.test(url))
+    .slice(0, 24);
+}
+
 function stringField(formData, key) {
   const value = formData.get(key);
   return typeof value === "string" ? value.trim() : "";
@@ -1822,6 +2038,11 @@ function truncateForPrompt(value, maxLength) {
     return text;
   }
   return `${text.slice(0, maxLength)}\n[truncated]`;
+}
+
+function truncateText(value, maxLength) {
+  const text = stringValue(value);
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
 }
 
 function clampNumber(value, min, max) {

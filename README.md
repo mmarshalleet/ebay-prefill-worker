@@ -2,7 +2,7 @@
 
 Cloudflare Worker for turning iOS Shortcut photo uploads into private eBay listing drafts. It identifies the item with OpenAI Vision, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
 
-Publishing is deliberately gated. `POST /approve` only marks a saved draft as `ready_to_publish_later`; it does not call any eBay listing or inventory publish API.
+Publishing is deliberately gated. `POST /approve` creates or reuses an unpublished eBay Inventory item and offer draft, but it does not call `publishOffer`.
 
 ## Endpoints
 
@@ -129,10 +129,20 @@ If `categoryId` is provided, it is used instead of the auto-selected category. I
 Returns the draft with:
 
 ```json
-{ "status": "ready_to_publish_later", "publishEnabled": false }
+{
+  "status": "ebay_offer_draft_created",
+  "publishEnabled": false,
+  "ebayInventoryItem": {
+    "sku": "draft-..."
+  },
+  "ebayOffer": {
+    "offerId": "...",
+    "status": "unpublished"
+  }
+}
 ```
 
-No eBay publish APIs are called.
+No eBay publish APIs are called. Repeating `/approve` for a draft that already has an `offerId` reuses the saved offer metadata instead of creating duplicate offers.
 
 ## Category and Item Specifics
 
@@ -169,7 +179,32 @@ It then merges AI-detected item specifics with `Brand`, `MPN`, `Model`, and manu
 }
 ```
 
-This payload is only returned and saved as a draft. The Worker does not call `publishOffer` or any other eBay publishing API.
+This payload is returned, saved as a draft, and used by `/approve` to create the eBay Inventory item and unpublished offer. The Worker does not call `publishOffer`.
+
+## eBay Draft Creation
+
+`POST /approve` uses the saved draft to call:
+
+```text
+PUT https://api.ebay.com/sell/inventory/v1/inventory_item/{sku}
+POST https://api.ebay.com/sell/inventory/v1/offer
+```
+
+The offer stays unpublished until you list it in eBay or add a separately gated `publishOffer` step later.
+
+Required for `/approve`:
+
+- `EBAY_TOKEN`: a seller/user OAuth access token with Sell Inventory scope. This is different from the app client-credentials token used for Browse and Taxonomy.
+
+Recommended for offers that are closer to publish-ready:
+
+- `EBAY_MERCHANT_LOCATION_KEY`
+- `EBAY_FULFILLMENT_POLICY_ID`
+- `EBAY_PAYMENT_POLICY_ID`
+- `EBAY_RETURN_POLICY_ID`
+- `EBAY_CONTENT_LANGUAGE`, defaults to `en-US`
+
+The current Shortcut uploads raw photos to the Worker for AI identification. eBay Inventory publishing requires HTTPS image URLs, so the created offer may still need images added in eBay unless you extend the flow to host or upload photos and pass `imageUrls`.
 
 ## Pricing
 
@@ -239,12 +274,22 @@ Add secrets:
 npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put EBAY_CLIENT_ID
 npx wrangler secret put EBAY_CLIENT_SECRET
+npx wrangler secret put EBAY_TOKEN
 ```
 
 Optional sold comp support:
 
 ```bash
 npx wrangler secret put SERPAPI_KEY
+```
+
+Optional eBay offer setup:
+
+```bash
+npx wrangler secret put EBAY_MERCHANT_LOCATION_KEY
+npx wrangler secret put EBAY_FULFILLMENT_POLICY_ID
+npx wrangler secret put EBAY_PAYMENT_POLICY_ID
+npx wrangler secret put EBAY_RETURN_POLICY_ID
 ```
 
 `EBAY_MARKETPLACE_ID` defaults to `EBAY_US` in `wrangler.toml`. Change it there if you need a different marketplace.
