@@ -1,5 +1,5 @@
 {
-  "name": "ebay-prefill-worker",
+  "name": "ebay-export",
   "main": "src/index.js",
   "compatibility_date": "2026-04-21",
   "vars": {
