@@ -85,12 +85,12 @@ export default {
         return jsonResponse({
           status: "ok",
           service: "eBay photo-to-listing draft generator",
-          publishEnabled: false,
+          publishEnabled: true,
           endpoints: [
             { method: "GET", path: "/", description: "Worker status and endpoint list" },
             { method: "POST", path: "/draft", description: "Create a draft from item photos" },
             { method: "GET", path: "/draft?id=...", description: "Retrieve a saved draft" },
-            { method: "POST", path: "/approve", description: "Validate overrides and mark a draft ready for later publishing" }
+            { method: "POST", path: "/approve", description: "Validate overrides, create an eBay offer, and publish it" }
           ]
         });
       }
@@ -131,6 +131,7 @@ export default {
 
 async function createDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
+  requireBinding(env, "IMAGES");
   requireSecret(env, "OPENAI_API_KEY");
   requireSecret(env, "EBAY_CLIENT_ID");
   requireSecret(env, "EBAY_CLIENT_SECRET");
@@ -154,6 +155,13 @@ async function createDraft(request, env) {
   const priceMode = parsePriceMode(stringField(formData, "priceMode"));
   const cost = optionalNumberField(formData, "cost");
   const desiredMarginPercent = optionalNumberField(formData, "desiredMarginPercent");
+  const draftId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const imageHostResult = await hostUploadedImages({
+    imageFiles,
+    draftId,
+    env
+  });
   const images = await Promise.all(imageFiles.map(fileToOpenAIImagePart));
 
   let identification;
@@ -187,8 +195,6 @@ async function createDraft(request, env) {
   });
 
   const ebayToken = await getEbayToken(env);
-  const draftId = crypto.randomUUID();
-  const now = new Date().toISOString();
   const pricingInputs = {
     priceMode,
     cost,
@@ -211,7 +217,9 @@ async function createDraft(request, env) {
     extractedPartNumbers: identification.extractedPartNumbers,
     itemSpecifics: normalizeItemSpecifics(identification.itemSpecifics),
     descriptionBullets: identification.descriptionBullets,
-    imageUrls: [],
+    imageUrls: imageHostResult.imageUrls,
+    hostedImages: imageHostResult.hostedImages,
+    imageHostWarnings: imageHostResult.imageHostWarnings,
     input: {
       notes,
       requestedCondition,
@@ -220,7 +228,8 @@ async function createDraft(request, env) {
       priceMode,
       cost,
       desiredMarginPercent,
-      imageCount: imageFiles.length
+      imageCount: imageFiles.length,
+      hostedImageCount: imageHostResult.imageUrls.length
     },
     pricingInputs,
     identification,
@@ -314,7 +323,7 @@ async function approveDraft(request, env) {
     saveDraft: true,
     successStatus: "ready_to_publish_later",
     successHttpStatus: 200,
-    afterValidDraft: async (validatedDraft) => createUnpublishedEbayOfferDraft(validatedDraft, env)
+    afterValidDraft: async (validatedDraft) => createAndPublishEbayOffer(validatedDraft, env)
   });
 }
 
@@ -458,6 +467,47 @@ async function identifyItemWithOpenAI(apiKey, imageParts, input) {
   return normalizeIdentification(parsed);
 }
 
+async function hostUploadedImages({ imageFiles, draftId, env }) {
+  const imageUrls = [];
+  const hostedImages = [];
+  const imageHostWarnings = [];
+  const publicBaseUrl = getR2PublicBaseUrl(env);
+
+  for (const [index, file] of imageFiles.entries()) {
+    const mimeType = file.type || "application/octet-stream";
+    if (!mimeType.startsWith("image/")) {
+      imageHostWarnings.push(`Skipped non-image upload ${file.name || index + 1}.`);
+      continue;
+    }
+
+    const filename = generateImageFilename();
+    const key = `ebay-images/${filename}`;
+    await env.IMAGES.put(key, await file.arrayBuffer(), {
+      httpMetadata: {
+        contentType: mimeType,
+        cacheControl: "public, max-age=31536000, immutable"
+      },
+      customMetadata: {
+        draftId,
+        originalName: truncateText(file.name || "", 200)
+      }
+    });
+
+    const url = `${publicBaseUrl}/${key}`;
+    imageUrls.push(url);
+    hostedImages.push({
+      key,
+      filename,
+      url,
+      contentType: mimeType,
+      originalName: file.name || "",
+      size: file.size || null
+    });
+  }
+
+  return { imageUrls, hostedImages, imageHostWarnings };
+}
+
 async function getEbayToken(env) {
   const credentials = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
   const body = new URLSearchParams({
@@ -482,15 +532,40 @@ async function getEbayToken(env) {
   return payload.access_token;
 }
 
-async function createUnpublishedEbayOfferDraft(draft, env) {
-  if (draft.ebayOffer?.offerId) {
+async function createAndPublishEbayOffer(draft, env) {
+  if (draft.ebayListing?.listingId) {
     return {
       ...draft,
-      status: "ebay_offer_draft_created",
-      publishEnabled: false,
+      status: "ebay_listing_published",
+      publishEnabled: true,
       ebayOffer: {
         ...draft.ebayOffer,
+        status: "published",
+        publishEnabled: true,
+        reusedExistingOffer: true,
+        reusedExistingListing: true
+      },
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  if (draft.ebayOffer?.offerId) {
+    const publishResult = await publishEbayOffer({ offerId: draft.ebayOffer.offerId, env });
+    const listingId = stringValue(publishResult.listingId);
+
+    return {
+      ...draft,
+      status: "ebay_listing_published",
+      publishEnabled: true,
+      ebayOffer: {
+        ...draft.ebayOffer,
+        status: "published",
+        publishEnabled: true,
         reusedExistingOffer: true
+      },
+      ebayListing: {
+        listingId,
+        raw: publishResult
       },
       updatedAt: new Date().toISOString()
     };
@@ -514,23 +589,33 @@ async function createUnpublishedEbayOfferDraft(draft, env) {
 
   const offerPayload = buildEbayOfferPayload(draft, sku, suggestedPrice, env);
   const offer = await createEbayOffer({ payload: offerPayload, env });
+  const offerId = stringValue(offer.offerId);
+  if (!offerId) {
+    throw new Error("eBay Inventory createOffer did not return an offerId.");
+  }
+  const publishResult = await publishEbayOffer({ offerId, env });
+  const listingId = stringValue(publishResult.listingId);
 
   return {
     ...draft,
     sku,
-    status: "ebay_offer_draft_created",
-    publishEnabled: false,
+    status: "ebay_listing_published",
+    publishEnabled: true,
     ebayInventoryItem: {
       sku,
       createdOrUpdated: true,
       payload: inventoryItemPayload
     },
     ebayOffer: {
-      offerId: offer.offerId || "",
-      status: "unpublished",
-      publishEnabled: false,
+      offerId,
+      status: "published",
+      publishEnabled: true,
       payload: offerPayload,
       raw: offer
+    },
+    ebayListing: {
+      listingId,
+      raw: publishResult
     },
     updatedAt: new Date().toISOString()
   };
@@ -558,6 +643,15 @@ async function createEbayOffer({ payload, env }) {
   });
 
   return await parseJsonResponse(response, "eBay Inventory createOffer");
+}
+
+async function publishEbayOffer({ offerId, env }) {
+  const response = await fetch(`${EBAY_INVENTORY_URL}/offer/${encodeURIComponent(offerId)}/publish`, {
+    method: "POST",
+    headers: getEbaySellHeaders(env)
+  });
+
+  return await parseJsonResponse(response, "eBay Inventory publishOffer");
 }
 
 function buildEbayInventoryItemPayload(draft) {
@@ -1043,11 +1137,15 @@ async function getSoldCompsFromSerpApi(query, env) {
 function buildSoldCompQueries(draft) {
   const mpn = firstNonEmpty([draft.mpn, draft.identification?.mpn, ...getDraftPartNumbers(draft)]);
   const brand = firstNonEmpty([draft.brand, draft.identification?.brand]);
+  const model = firstNonEmpty([draft.model, draft.identification?.model]);
+  const title = firstNonEmpty([draft.title, draft.identification?.title]);
 
   return uniqueNonEmpty([
     mpn ? `"${mpn}" site:ebay.com/itm sold completed` : "",
     mpn && brand ? `"${brand}" "${mpn}" site:ebay.com/itm sold` : "",
-    mpn ? `"${mpn}" "Sold" "Completed" eBay` : ""
+    mpn ? `"${mpn}" "Sold" "Completed" eBay` : "",
+    model && brand ? `"${brand}" "${model}" site:ebay.com/itm sold completed` : "",
+    title ? `"${title}" site:ebay.com/itm sold completed` : ""
   ]);
 }
 
@@ -1997,6 +2095,26 @@ function normalizeImageUrls(value) {
   return uniqueNonEmpty(value)
     .filter((url) => /^https:\/\//i.test(url))
     .slice(0, 24);
+}
+
+function getR2PublicBaseUrl(env) {
+  const publicBaseUrl = stringValue(env.R2_PUBLIC_BASE_URL).replace(/\/+$/g, "");
+  if (publicBaseUrl) {
+    return publicBaseUrl;
+  }
+
+  const accountId = stringValue(env.R2_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || env.ACCOUNT_ID);
+  if (!accountId) {
+    throw new Error("Missing required R2 public URL: set R2_PUBLIC_BASE_URL.");
+  }
+
+  return `https://pub-${accountId}.r2.dev`;
+}
+
+function generateImageFilename() {
+  const timestamp = Date.now();
+  const random = crypto.randomUUID().replace(/-/g, "");
+  return `${timestamp}-${random}.jpg`;
 }
 
 function stringField(formData, key) {

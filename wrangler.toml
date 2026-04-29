@@ -4,11 +4,16 @@ compatibility_date = "2026-04-28"
 
 [vars]
 EBAY_MARKETPLACE_ID = "EBAY_US"
+R2_ACCOUNT_ID = "1ffb978bd5dcde51bff6bb86d52f0bc1"
+R2_PUBLIC_BASE_URL = "https://pub-349d0c2dfb6a4ea29a9d8942f9d53ad3.r2.dev"
 
 [[kv_namespaces]]
 binding = "DRAFT_KV"
 id = "d76930f9d9b34001ba8359bc456b5b95"
 preview_id = "363498ff7e264a83bd86186249377efe"
+
+# Hosted listing photos for eBay Inventory drafts.
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "ebay-images"
+preview_bucket_name = "ebay-images"
