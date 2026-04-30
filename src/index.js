@@ -76,6 +76,9 @@ export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
+      if (request.method === "POST" && url.pathname === "/publish") {
+  return await publishDraft(request, env);
+}
     }
 
     try {
@@ -135,6 +138,48 @@ async function createDraft(request, env) {
   requireSecret(env, "OPENAI_API_KEY");
   requireSecret(env, "EBAY_CLIENT_ID");
   requireSecret(env, "EBAY_CLIENT_SECRET");
+
+async function publishDraft(request, env) {
+  const body = await request.json();
+  const draftId = body?.draftId;
+
+  if (!draftId) {
+    return new Response(JSON.stringify({ error: "missing_draft_id" }), { status: 400 });
+  }
+
+  const draft = await env.DRAFT_KV.get(draftId, { type: "json" });
+
+  if (!draft) {
+    return new Response(JSON.stringify({ error: "draft_not_found" }), { status: 404 });
+  }
+
+  const offerId = draft?.ebayOffer?.offerId;
+
+  if (!offerId) {
+    return new Response(JSON.stringify({ error: "missing_offer_id" }), { status: 400 });
+  }
+
+  const publishResult = await publishEbayOffer({
+    offerId,
+    env
+  });
+
+  const updatedDraft = {
+    ...draft,
+    status: "ebay_listing_published",
+    publishEnabled: false,
+    ebayListing: {
+      listingId: publishResult.listingId
+    },
+    updatedAt: new Date().toISOString()
+  };
+
+  await env.DRAFT_KV.put(draftId, JSON.stringify(updatedDraft));
+
+  return new Response(JSON.stringify(updatedDraft), {
+    headers: { "Content-Type": "application/json" }
+  });
+}
 
   const contentType = request.headers.get("Content-Type") || "";
   if (!contentType.includes("multipart/form-data")) {
@@ -323,7 +368,7 @@ async function approveDraft(request, env) {
     saveDraft: true,
     successStatus: "ready_to_publish_later",
     successHttpStatus: 200,
-    afterValidDraft: async (validatedDraft) => createAndPublishEbayOffer(validatedDraft, env)
+  afterValidDraft: async (validatedDraft) => createEbayOfferDraftOnly(validatedDraft, env)
   });
 }
 
@@ -582,7 +627,55 @@ async function createAndPublishEbayOffer(draft, env) {
       updatedAt: new Date().toISOString()
     };
   }
+async function createEbayOfferDraftOnly(draft, env) {
+  if (draft.ebayListing?.listingId) {
+    return {
+      ...draft,
+      status: "already_published",
+      publishEnabled: false,
+      updatedAt: new Date().toISOString()
+    };
+  }
 
+  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice;
+
+  if (!suggestedPrice) {
+    return {
+      ...draft,
+      status: "price_required",
+      publishEnabled: false
+    };
+  }
+
+  const sku = draft.sku || `draft-${Date.now()}`;
+
+  const inventoryItemPayload = buildEbayInventoryItemPayload(draft);
+
+  await putEbayInventoryItem({
+    sku,
+    payload: inventoryItemPayload,
+    env
+  });
+
+  const offerPayload = buildEbayOfferPayload(draft, sku, suggestedPrice, env);
+
+  const offer = await createEbayOffer({
+    payload: offerPayload,
+    env
+  });
+
+  return {
+    ...draft,
+    sku,
+    status: "ebay_offer_draft_created",
+    publishEnabled: true,
+    ebayOffer: {
+      offerId: offer.offerId,
+      status: "unpublished"
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
   const sku = draft.sku || buildSku(draft);
   const inventoryItemPayload = buildEbayInventoryItemPayload(draft);
   await putEbayInventoryItem({ sku, payload: inventoryItemPayload, env });
