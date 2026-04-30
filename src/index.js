@@ -76,9 +76,6 @@ export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
-      if (request.method === "POST" && url.pathname === "/publish") {
-  return await publishDraft(request, env);
-}
     }
 
     try {
@@ -93,10 +90,45 @@ export default {
             { method: "GET", path: "/", description: "Worker status and endpoint list" },
             { method: "POST", path: "/draft", description: "Create a draft from item photos" },
             { method: "GET", path: "/draft?id=...", description: "Retrieve a saved draft" },
-            { method: "POST", path: "/approve", description: "Validate overrides, create an eBay offer, and publish it" }
+            { method: "POST", path: "/approve", description: "Validate overrides and create an unpublished eBay offer" },
+            { method: "POST", path: "/publish", description: "Publish an approved eBay offer" }
           ]
         });
       }
+
+      if (url.pathname === "/draft") {
+        if (request.method === "POST") return await createDraft(request, env);
+        if (request.method === "GET") return await getDraft(url, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/approve") {
+        return await approveDraft(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/publish") {
+        return await publishDraft(request, env);
+      }
+
+      return jsonResponse({ error: "not_found" }, 404);
+    } catch (error) {
+      if (error instanceof ExternalApiError) {
+        return jsonResponse({
+          error: "external_api_error",
+          service: error.service,
+          status: error.status,
+          message: error.message,
+          raw: error.payload
+        }, 502);
+      }
+
+      return jsonResponse({
+        error: "internal_error",
+        message: error instanceof Error ? error.message : "Unexpected error"
+      }, 500);
+    }
+  }
+};
+    
 
       if (url.pathname === "/draft") {
         if (request.method === "POST") {
