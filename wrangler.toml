@@ -3,6 +3,7 @@ main = "src/index.js"
 compatibility_date = "2026-04-28"
 
 [vars]
+EBAY_CLIENT_ID = "MitchMar-shortcut-SBX-1e0485491-4ec84106"
 EBAY_MARKETPLACE_ID = "EBAY_US"
 R2_ACCOUNT_ID = "1ffb978bd5dcde51bff6bb86d52f0bc1"
 R2_PUBLIC_BASE_URL = "https://pub-349d0c2dfb6a4ea29a9d8942f9d53ad3.r2.dev"
