@@ -20,7 +20,7 @@ bucket_name = "ebay-images"
 preview_bucket_name = "ebay-images"
 
 [observability]
-enabled = true
+enabled = false
 head_sampling_rate = 1
 
 [observability.logs]
