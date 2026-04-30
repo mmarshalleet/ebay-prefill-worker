@@ -90,7 +90,9 @@ export default {
             { method: "GET", path: "/", description: "Worker status and endpoint list" },
             { method: "POST", path: "/draft", description: "Create a draft from item photos" },
             { method: "GET", path: "/draft?id=...", description: "Retrieve a saved draft" },
-            { method: "POST", path: "/approve", description: "Validate overrides, create an eBay offer, and publish it" }
+            { method: "POST", path: "/approve", description: "Validate overrides and create an unpublished eBay offer" },
+            { method: "POST", path: "/publish", description: "Publish an existing eBay offer" },
+            { method: "POST", path: "/instant-list", description: "Approve and publish only when the draft is eligible" }
           ]
         });
       }
@@ -107,6 +109,14 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/approve") {
         return await approveDraft(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/publish") {
+        return await publishDraft(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/instant-list") {
+        return await instantListDraft(request, env);
       }
 
       return jsonResponse({ error: "not_found" }, 404);
@@ -149,10 +159,10 @@ async function createDraft(request, env) {
   }
 
   const notes = stringField(formData, "notes");
-  const requestedCondition = stringField(formData, "condition");
+  const userCondition = stringField(formData, "condition");
   const ocrText = stringField(formData, "ocrText");
   const quantity = positiveIntegerField(formData, "quantity", 1);
-  const priceMode = parsePriceMode(stringField(formData, "priceMode"));
+  const userPriceMode = parseUserPriceMode(stringField(formData, "priceMode"));
   const cost = optionalNumberField(formData, "cost");
   const desiredMarginPercent = optionalNumberField(formData, "desiredMarginPercent");
   const draftId = crypto.randomUUID();
@@ -168,7 +178,7 @@ async function createDraft(request, env) {
   try {
     identification = await identifyItemWithOpenAI(env.OPENAI_API_KEY, images, {
       notes,
-      condition: requestedCondition,
+      condition: userCondition,
       quantity,
       ocrText
     });
@@ -193,10 +203,31 @@ async function createDraft(request, env) {
     notes,
     ocrText
   });
+  const conditionDecision = determineCondition({
+    aiCondition: identification.condition,
+    userCondition,
+    ocrText,
+    notes,
+    title: identification.title
+  });
+  identification = {
+    ...identification,
+    condition: conditionDecision.condition
+  };
+  const priceModeDecision = determinePriceMode({
+    userPriceMode,
+    condition: conditionDecision.condition,
+    brand: identification.brand,
+    mpn: identification.mpn,
+    ocrText,
+    notes,
+    aiConfidence: identification.confidence
+  });
+  const brandStrategy = getBrandStrategy(identification.brand);
 
   const ebayToken = await getEbayToken(env);
   const pricingInputs = {
-    priceMode,
+    priceMode: priceModeDecision.priceMode,
     cost,
     desiredMarginPercent,
     ocrText
@@ -211,7 +242,9 @@ async function createDraft(request, env) {
     brand: identification.brand,
     model: identification.model,
     mpn: identification.mpn,
-    condition: identification.condition,
+    condition: conditionDecision.condition,
+    conditionSource: conditionDecision.source,
+    conditionSignals: conditionDecision.signals,
     categoryHint: identification.categoryHint,
     ocrText,
     extractedPartNumbers: identification.extractedPartNumbers,
@@ -222,15 +255,19 @@ async function createDraft(request, env) {
     imageHostWarnings: imageHostResult.imageHostWarnings,
     input: {
       notes,
-      requestedCondition,
+      requestedCondition: userCondition,
       ocrText,
       quantity,
-      priceMode,
+      priceMode: userPriceMode,
       cost,
       desiredMarginPercent,
       imageCount: imageFiles.length,
       hostedImageCount: imageHostResult.imageUrls.length
     },
+    priceMode: priceModeDecision.priceMode,
+    priceModeSource: priceModeDecision.source,
+    priceModeSignals: priceModeDecision.signals,
+    brandStrategy,
     pricingInputs,
     identification,
     ebaySearch: {
@@ -252,7 +289,7 @@ async function createDraft(request, env) {
     enrichDraft: async (validatedDraft) => addPricingToDraft(validatedDraft, {
       env,
       token: ebayToken,
-      priceMode,
+      priceMode: priceModeDecision.priceMode,
       cost,
       desiredMarginPercent
     })
@@ -323,8 +360,83 @@ async function approveDraft(request, env) {
     saveDraft: true,
     successStatus: "ready_to_publish_later",
     successHttpStatus: 200,
-    afterValidDraft: async (validatedDraft) => createAndPublishEbayOffer(validatedDraft, env)
+    afterValidDraft: async (validatedDraft) => createEbayOfferDraftOnly(validatedDraft, env)
   });
+}
+
+async function publishDraft(request, env) {
+  requireBinding(env, "DRAFT_KV");
+  requireSecret(env, "EBAY_TOKEN");
+
+  const body = await parseJsonRequest(request, "POST /publish requires JSON.");
+  if (body.errorResponse) {
+    return body.errorResponse;
+  }
+
+  const draftId = stringValue(body.draftId);
+  if (!draftId) {
+    return jsonResponse({ error: "missing_draft_id", message: "Expected { \"draftId\": \"...\" }." }, 400);
+  }
+
+  const draft = await env.DRAFT_KV.get(draftId, { type: "json" });
+  if (!draft) {
+    return jsonResponse({ error: "draft_not_found" }, 404);
+  }
+
+  if (!draft.ebayOffer?.offerId) {
+    return jsonResponse({
+      error: "offer_required",
+      message: "Approve the draft before publishing so an eBay offer exists."
+    }, 409);
+  }
+
+  const publishedDraft = await publishExistingEbayOffer(draft, env);
+  await saveDraftToKv(env, publishedDraft);
+  return jsonResponse(publishedDraft);
+}
+
+async function instantListDraft(request, env) {
+  requireBinding(env, "DRAFT_KV");
+  requireSecret(env, "EBAY_TOKEN");
+
+  const body = await parseJsonRequest(request, "POST /instant-list requires JSON.");
+  if (body.errorResponse) {
+    return body.errorResponse;
+  }
+
+  const draftId = stringValue(body.draftId);
+  if (!draftId) {
+    return jsonResponse({ error: "missing_draft_id", message: "Expected { \"draftId\": \"...\" }." }, 400);
+  }
+
+  const draft = await env.DRAFT_KV.get(draftId, { type: "json" });
+  if (!draft) {
+    return jsonResponse({ error: "draft_not_found" }, 404);
+  }
+
+  const eligibility = evaluateAutoPublishEligibility(draft);
+  if (!eligibility.eligible) {
+    const blockedDraft = {
+      ...draft,
+      autoPublishEligibility: eligibility,
+      updatedAt: new Date().toISOString()
+    };
+    await saveDraftToKv(env, blockedDraft);
+    return jsonResponse({
+      error: "instant_list_not_eligible",
+      message: "Draft is not eligible for instant listing.",
+      reasons: eligibility.reasons,
+      draft: blockedDraft
+    }, 409);
+  }
+
+  const offerDraft = await createEbayOfferDraftOnly({
+    ...draft,
+    autoPublishEligibility: eligibility
+  }, env);
+  const publishedDraft = await publishExistingEbayOffer(offerDraft, env);
+  await saveDraftToKv(env, publishedDraft);
+  return jsonResponse(publishedDraft);
 }
 
 async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus, enrichDraft, afterValidDraft }) {
@@ -439,7 +551,7 @@ async function identifyItemWithOpenAI(apiKey, imageParts, input) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "gpt-4.0",
+      model: "gpt-4o",
       input: [
         {
           role: "user",
@@ -532,11 +644,24 @@ async function getEbayToken(env) {
   return payload.access_token;
 }
 
-async function createAndPublishEbayOffer(draft, env) {
+async function createEbayOfferDraftOnly(draft, env) {
+  if (draft.pricing?.priceConfidence < 0.45) {
+    return {
+      ...draft,
+      status: "pricing_review_required",
+      publishEnabled: false,
+      ebayOfferWarnings: [
+        ...(Array.isArray(draft.ebayOfferWarnings) ? draft.ebayOfferWarnings : []),
+        "Low pricing confidence; manual review recommended."
+      ],
+      updatedAt: new Date().toISOString()
+    };
+  }
+
   if (draft.ebayListing?.listingId) {
     return {
       ...draft,
-      status: "ebay_listing_published",
+      status: "already_published",
       publishEnabled: true,
       ebayOffer: {
         ...draft.ebayOffer,
@@ -550,22 +675,15 @@ async function createAndPublishEbayOffer(draft, env) {
   }
 
   if (draft.ebayOffer?.offerId) {
-    const publishResult = await publishEbayOffer({ offerId: draft.ebayOffer.offerId, env });
-    const listingId = stringValue(publishResult.listingId);
-
     return {
       ...draft,
-      status: "ebay_listing_published",
+      status: "ready_to_publish_later",
       publishEnabled: true,
       ebayOffer: {
         ...draft.ebayOffer,
-        status: "published",
+        status: draft.ebayOffer.status || "draft",
         publishEnabled: true,
         reusedExistingOffer: true
-      },
-      ebayListing: {
-        listingId,
-        raw: publishResult
       },
       updatedAt: new Date().toISOString()
     };
@@ -593,13 +711,11 @@ async function createAndPublishEbayOffer(draft, env) {
   if (!offerId) {
     throw new Error("eBay Inventory createOffer did not return an offerId.");
   }
-  const publishResult = await publishEbayOffer({ offerId, env });
-  const listingId = stringValue(publishResult.listingId);
 
   return {
     ...draft,
     sku,
-    status: "ebay_listing_published",
+    status: "ready_to_publish_later",
     publishEnabled: true,
     ebayInventoryItem: {
       sku,
@@ -608,10 +724,53 @@ async function createAndPublishEbayOffer(draft, env) {
     },
     ebayOffer: {
       offerId,
-      status: "published",
+      status: "draft",
       publishEnabled: true,
       payload: offerPayload,
       raw: offer
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function publishExistingEbayOffer(draft, env) {
+  if (draft.ebayListing?.listingId) {
+    return {
+      ...draft,
+      status: "ebay_listing_published",
+      publishEnabled: true,
+      ebayOffer: {
+        ...draft.ebayOffer,
+        status: "published",
+        publishEnabled: true,
+        reusedExistingListing: true
+      },
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const offerId = stringValue(draft.ebayOffer?.offerId);
+  if (!offerId) {
+    return {
+      ...draft,
+      status: "offer_required_before_publish",
+      publishEnabled: false,
+      ebayOfferWarnings: ["No eBay offer exists yet. Approve the draft before publishing."],
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const publishResult = await publishEbayOffer({ offerId, env });
+  const listingId = stringValue(publishResult.listingId);
+
+  return {
+    ...draft,
+    status: "ebay_listing_published",
+    publishEnabled: true,
+    ebayOffer: {
+      ...draft.ebayOffer,
+      status: "published",
+      publishEnabled: true
     },
     ebayListing: {
       listingId,
@@ -739,6 +898,277 @@ function buildSku(draft) {
   return truncateText(`draft-${draft.id}`, 50);
 }
 
+function determineCondition({ aiCondition, userCondition, ocrText, notes, title }) {
+  const user = stringValue(userCondition);
+  if (user) {
+    return {
+      condition: user,
+      source: "user_override",
+      signals: [`User provided condition: ${user}`]
+    };
+  }
+
+  const text = joinSignalText([ocrText, notes, title]);
+  const explicitSignals = [
+    { condition: "New Sealed", patterns: ["factory sealed", "new sealed", "never opened", "sealed"] },
+    { condition: "Open Box", patterns: ["open box", "new other", "unused", "new without box", "shelf spare"] },
+    { condition: "For Parts", patterns: ["for parts", "not working", "repair", "damaged", "broken"] },
+    { condition: "Used Tested", patterns: ["tested", "working pull", "pulled from working equipment"] }
+  ];
+
+  for (const signal of explicitSignals) {
+    const match = signal.patterns.find((pattern) => text.includes(pattern));
+    if (match) {
+      return {
+        condition: signal.condition,
+        source: "text_signal",
+        signals: [`Matched text signal: ${match}`]
+      };
+    }
+  }
+
+  const ai = stringValue(aiCondition);
+  if (ai) {
+    return {
+      condition: ai,
+      source: "ai_condition",
+      signals: [`AI suggested condition: ${ai}`]
+    };
+  }
+
+  return {
+    condition: "Used",
+    source: "fallback",
+    signals: ["No explicit condition signal found; defaulted to Used."]
+  };
+}
+
+function determinePriceMode({ userPriceMode, condition, brand, mpn, ocrText, notes, aiConfidence }) {
+  const user = parseUserPriceMode(userPriceMode);
+  if (user) {
+    return {
+      priceMode: user,
+      source: "user_override",
+      signals: [`User provided price mode: ${user}`]
+    };
+  }
+
+  const signals = [];
+  const text = joinSignalText([ocrText, notes]);
+  const brandStrategy = getBrandStrategy(brand);
+  const exactMpn = hasStrongMpn(mpn) || extractPartNumbers(`${mpn} ${ocrText}`).some(hasStrongMpn);
+
+  if (/\b(quick sale|move fast|clearance|liquidate)\b/.test(text)) {
+    return {
+      priceMode: "fast_sale",
+      source: "text_signal",
+      signals: ["Fast sale signal found in OCR text or notes."]
+    };
+  }
+
+  if (brandStrategy.premium) {
+    signals.push(`Premium industrial brand: ${brandStrategy.brand}`);
+  }
+
+  if (exactMpn) {
+    signals.push("Exact-looking MPN found.");
+  }
+
+  if (brandStrategy.premium || exactMpn) {
+    return {
+      priceMode: "premium",
+      source: brandStrategy.premium ? "brand_premium" : "exact_mpn",
+      signals
+    };
+  }
+
+  if (Number(aiConfidence) < 0.55) {
+    return {
+      priceMode: "market",
+      source: "ai_confidence",
+      signals: [`AI confidence ${roundCurrency(Number(aiConfidence) || 0)} below 0.55.`]
+    };
+  }
+
+  return {
+    priceMode: "market",
+    source: "market_fallback",
+    signals: ["No premium brand or exact MPN signal found."]
+  };
+}
+
+function getBrandStrategy(brand) {
+  const normalized = stringValue(brand).toLowerCase();
+  const premiumBrands = [
+    "allen-bradley",
+    "allen bradley",
+    "rockwell",
+    "siemens",
+    "keyence",
+    "omron",
+    "banner",
+    "schmersal",
+    "danfoss",
+    "lenze",
+    "marel",
+    "ishida",
+    "secomea",
+    "phoenix contact"
+  ];
+  const matchedBrand = premiumBrands.find((premiumBrand) => normalized.includes(premiumBrand));
+
+  if (matchedBrand) {
+    return {
+      premium: true,
+      brand: stringValue(brand),
+      defaultPriceMode: "premium",
+      scarcityAdjustmentCap: 0.25,
+      reason: "Premium industrial brand supports premium pricing and patient repricing."
+    };
+  }
+
+  return {
+    premium: false,
+    brand: stringValue(brand),
+    defaultPriceMode: "market",
+    scarcityAdjustmentCap: 0.1,
+    reason: "Unknown or nonindustrial brand uses conservative market pricing."
+  };
+}
+
+function applyPricingConfidencePolicy(draft, pricing) {
+  const confidence = Number(pricing.priceConfidence);
+  const warnings = Array.isArray(pricing.pricingWarnings) ? [...pricing.pricingWarnings] : [];
+
+  if (confidence < 0.45) {
+    warnings.push("Low pricing confidence; manual review recommended.");
+    return {
+      status: "pricing_review_required",
+      publishEnabled: false,
+      reviewRequired: true,
+      pricing: {
+        ...pricing,
+        pricingWarnings: uniqueNonEmpty(warnings)
+      }
+    };
+  }
+
+  if (confidence < 0.7) {
+    warnings.push("Moderate pricing confidence.");
+    return {
+      status: draft.status,
+      publishEnabled: false,
+      reviewRequired: false,
+      pricing: {
+        ...pricing,
+        pricingWarnings: uniqueNonEmpty(warnings)
+      }
+    };
+  }
+
+  return {
+    status: draft.status,
+    publishEnabled: false,
+    reviewRequired: false,
+    pricing
+  };
+}
+
+function buildListingStrategy({ draft, pricing, priceMode, reviewRequired }) {
+  const mode = parsePriceMode(priceMode);
+  const exactIndustrial = Boolean(getBrandStrategy(draft.brand || draft.identification?.brand).premium && hasStrongMpn(draft.mpn || draft.identification?.mpn));
+  let watchStrategy;
+  let markdownSchedule;
+  let reason;
+
+  if (mode === "fast_sale") {
+    watchStrategy = "Watch closely for the first 7 days.";
+    markdownSchedule = [
+      { afterDays: 7, action: "reduce_price", percent: 5, condition: "if no sale" },
+      { afterDays: 14, action: "reduce_price", percent: 10, condition: "if no sale" }
+    ];
+    reason = "Fast sale mode favors early markdowns to move inventory.";
+  } else if (exactIndustrial && mode === "premium") {
+    watchStrategy = "Hold premium price for 14 days, then review watchers and views.";
+    markdownSchedule = [
+      { afterDays: 14, action: "reduce_price", percent: 5, condition: "if no watchers or views" },
+      { afterDays: 30, action: "reduce_price", percent: "5-10", condition: "if no sale" }
+    ];
+    reason = "Premium exact industrial part: start firm and give scarce buyers time to find it.";
+  } else {
+    watchStrategy = "Review market response after 7 days.";
+    markdownSchedule = [
+      { afterDays: 7, action: "review_interest", percent: 0, condition: "check watchers and views" },
+      { afterDays: 14, action: "reduce_price", percent: 5, condition: "if no interest" }
+    ];
+    reason = "Market mode tracks buyer interest and uses a modest markdown if the listing is quiet.";
+  }
+
+  return {
+    initialPrice: pricing.suggestedPrice,
+    priceMode: mode,
+    reviewRequired,
+    watchStrategy,
+    markdownSchedule,
+    autoPublishEligible: false,
+    reason
+  };
+}
+
+function evaluateAutoPublishEligibility(draft) {
+  const reasons = [];
+  const priceConfidence = Number(draft.pricing?.priceConfidence ?? 0);
+  const aiConfidence = Number(draft.identification?.confidence ?? 0);
+  const exactMpn = hasStrongMpn(draft.mpn || draft.identification?.mpn);
+  const missingRequired = Array.isArray(draft.missingRequiredAspects) ? draft.missingRequiredAspects.filter(Boolean) : [];
+  const imageUrls = Array.isArray(draft.imageUrls) ? draft.imageUrls.filter(Boolean) : [];
+  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice;
+  const pricingWarnings = Array.isArray(draft.pricing?.pricingWarnings) ? draft.pricing.pricingWarnings : [];
+  const severePricingWarnings = pricingWarnings.filter(isSeverePricingWarning);
+
+  if (priceConfidence < 0.85) {
+    reasons.push("Pricing confidence is below 0.85.");
+  }
+  if (aiConfidence < 0.8) {
+    reasons.push("AI identification confidence is below 0.8.");
+  }
+  if (!exactMpn) {
+    reasons.push("No exact MPN is available.");
+  }
+  if (missingRequired.length > 0) {
+    reasons.push(`Missing required item specifics: ${missingRequired.join(", ")}.`);
+  }
+  if (!draft.categoryId) {
+    reasons.push("No eBay categoryId is available.");
+  }
+  if (imageUrls.length < 2) {
+    reasons.push("At least two hosted image URLs are required.");
+  }
+  if (!isPositiveNumber(suggestedPrice)) {
+    reasons.push("Suggested price must be greater than 0.");
+  }
+  if (normalizeCondition(draft.condition || draft.identification?.condition) === "for_parts") {
+    reasons.push("For Parts listings are not eligible for instant listing.");
+  }
+  if (severePricingWarnings.length > 0) {
+    reasons.push(`Severe pricing warnings present: ${severePricingWarnings.join("; ")}.`);
+  }
+
+  return {
+    eligible: reasons.length === 0,
+    reasons
+  };
+}
+
+function isSeverePricingWarning(warning) {
+  const text = stringValue(warning).toLowerCase();
+  return text.includes("low pricing confidence")
+    || text.includes("manual review")
+    || text.includes("no reliable comps")
+    || text.includes("no accepted comps")
+    || text.includes("pricing search failed");
+}
+
 async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMarginPercent }) {
   const pricingWarnings = [];
   let activeComps = [];
@@ -769,10 +1199,13 @@ async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMa
     pricingWarnings
   });
   const activeAccepted = activeComps.filter((comp) => !comp.rejectReason);
+  const pricingPolicy = applyPricingConfidencePolicy(draft, pricing);
   const pricedDraft = {
     ...draft,
+    status: pricingPolicy.status || draft.status,
+    publishEnabled: pricingPolicy.publishEnabled,
     suggestedPrice: pricing.suggestedPrice,
-    pricing,
+    pricing: pricingPolicy.pricing,
     ebaySearch: {
       ...(draft.ebaySearch || {}),
       marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
@@ -781,7 +1214,19 @@ async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMa
       activeFixedPriceComps: activeAccepted,
       compCount: activeAccepted.length
     },
+    listingStrategy: buildListingStrategy({
+      draft,
+      pricing: pricingPolicy.pricing,
+      priceMode: pricing.mode,
+      reviewRequired: pricingPolicy.reviewRequired
+    }),
     updatedAt: new Date().toISOString()
+  };
+
+  pricedDraft.autoPublishEligibility = evaluateAutoPublishEligibility(pricedDraft);
+  pricedDraft.listingStrategy = {
+    ...pricedDraft.listingStrategy,
+    autoPublishEligible: pricedDraft.autoPublishEligibility.eligible
   };
 
   if (pricedDraft.ebayInventoryItemDraft && pricedDraft.ebayAspects) {
@@ -1233,7 +1678,13 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
     .sort((a, b) => b.matchScore - a.matchScore)
     .map(trimCompForPricing);
   const warnings = [...pricingWarnings];
-  const mode = parsePriceMode(priceMode);
+  let mode = parsePriceMode(priceMode);
+  const brandStrategy = getBrandStrategy(draft.brand || draft.identification?.brand);
+
+  if (mode === "premium" && !brandStrategy.premium && exactComps.length === 0) {
+    mode = "market";
+    warnings.push("Unknown or nonindustrial brand had no exact comps; market pricing used.");
+  }
 
   if (pricingComps.length === 0) {
     warnings.push("No accepted comps remained after scoring and filtering.");
@@ -1253,6 +1704,7 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
       activeCompCount: acceptedActive.length,
       soldCompCount: acceptedSold.length,
       scarcityAdjustment: 0,
+      brandStrategy,
       conditionMultiplier: getConditionMultiplier(draft.input?.requestedCondition || draft.condition || draft.identification?.condition),
       minimumMarginPrice: null,
       acceptedComps,
@@ -1269,7 +1721,8 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
   const soldMedian = medianPrice(acceptedSold);
   const exactActiveCount = exactActiveComps.length;
   const exactSoldCount = exactSoldComps.length;
-  const scarcityAdjustment = getScarcityAdjustment(exactActiveCount, exactSoldCount, acceptedActive.length);
+  const rawScarcityAdjustment = getScarcityAdjustment(exactActiveCount, exactSoldCount, acceptedActive.length);
+  const scarcityAdjustment = Math.min(rawScarcityAdjustment, brandStrategy.scarcityAdjustmentCap);
   const conditionMultiplier = getConditionMultiplier(draft.input?.requestedCondition || draft.condition || draft.identification?.condition);
   let basePrice;
 
@@ -1314,13 +1767,14 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
     activeMedian,
     soldMedian,
     priceConfidence: confidence,
-    pricingReason: buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps }),
+    pricingReason: buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps, brandStrategy }),
     pricingWarnings: warnings,
     compCount: acceptedActive.length + acceptedSold.length,
     exactCompCount: exactComps.length,
     activeCompCount: acceptedActive.length,
     soldCompCount: acceptedSold.length,
     scarcityAdjustment,
+    brandStrategy,
     conditionMultiplier,
     minimumMarginPrice,
     acceptedComps,
@@ -1708,10 +2162,14 @@ function calculatePriceConfidence({ draft, acceptedActive, acceptedSold, exactAc
   return roundCurrency(Math.max(0, Math.min(1, confidence)));
 }
 
-function buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps }) {
+function buildPricingReason({ mode, exactActiveComps, exactSoldComps, acceptedActive, scarcityAdjustment, exactComps, brandStrategy }) {
   const parts = [
     `Suggested ${mode.replace("_", " ")} price based on ${exactActiveComps.length} exact active comps and ${exactSoldComps.length} sold comps.`
   ];
+
+  if (mode === "premium" && brandStrategy?.premium) {
+    parts.push("Brand premium strategy applied for a premium industrial brand.");
+  }
 
   if (scarcityAdjustment > 0) {
     parts.push(`Scarcity adjustment applied because only ${exactActiveComps.length} exact active listing${exactActiveComps.length === 1 ? " was" : "s were"} found.`);
@@ -2137,9 +2595,42 @@ function optionalNumberField(formData, key) {
   return Number.isFinite(value) ? value : null;
 }
 
+function parseUserPriceMode(value) {
+  const mode = stringValue(value).toLowerCase();
+  return ["fast_sale", "market", "premium"].includes(mode) ? mode : "";
+}
+
 function parsePriceMode(value) {
   const mode = stringValue(value).toLowerCase();
   return ["fast_sale", "market", "premium"].includes(mode) ? mode : "premium";
+}
+
+async function parseJsonRequest(request, invalidMessage) {
+  try {
+    return await request.json();
+  } catch {
+    return {
+      errorResponse: jsonResponse({ error: "invalid_json", message: invalidMessage }, 400)
+    };
+  }
+}
+
+function joinSignalText(values) {
+  return values.map(stringValue).filter(Boolean).join(" ").toLowerCase();
+}
+
+function hasStrongMpn(value) {
+  const mpn = cleanPartNumber(value);
+  if (!mpn || mpn.length < 4) {
+    return false;
+  }
+  if (!/[a-z]/i.test(mpn) || !/\d/.test(mpn)) {
+    return false;
+  }
+  if (isLikelyMeasurement(mpn)) {
+    return false;
+  }
+  return /^[a-z0-9][a-z0-9._/-]{2,}[a-z0-9]$/i.test(mpn);
 }
 
 function firstNonEmpty(values) {

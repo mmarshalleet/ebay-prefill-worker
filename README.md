@@ -1,8 +1,8 @@
 # eBay Photo Listing Draft Worker
 
-Cloudflare Worker for turning iOS Shortcut photo uploads into eBay listing drafts. It identifies the item with OpenAI Vision, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
+Cloudflare Worker for turning iOS Shortcut photo uploads into eBay listing drafts. It identifies the item with OpenAI Vision, determines condition and price mode server-side, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
 
-Publishing happens on approval. `POST /approve` creates or reuses the eBay Inventory item and offer, then calls `publishOffer` to create the live listing.
+Publishing is intentionally split into safety-gated steps. `POST /approve` creates or reuses an unpublished eBay Inventory item and offer. `POST /publish` publishes an existing offer. `POST /instant-list` is the only endpoint that can approve and publish in one request, and only when the saved draft is auto-publish eligible.
 
 ## Endpoints
 
@@ -21,10 +21,12 @@ Required form field:
 Optional form fields:
 
 - `notes`
-- `condition`
-- `quantity`
 - `ocrText`: text recognized by the Shortcut or another OCR step from labels, plates, stickers, or packaging
-- `priceMode`: `fast_sale`, `market`, or `premium`; defaults to `premium`
+- `quantity`
+- `condition`: manual override only
+- `priceMode`: manual override only, `fast_sale`, `market`, or `premium`
+
+The Worker handles condition and price mode automatically unless those override fields are provided. The Shortcut does not need to make listing decisions.
 
 The response includes:
 
@@ -39,6 +41,10 @@ The response includes:
 - required and recommended item specifics for the selected category
 - missing required item specifics, if eBay requires values the photos did not provide
 - the KV draft id
+- `conditionSource` and `conditionSignals`
+- `priceModeSource` and `priceModeSignals`
+- `listingStrategy` with watch and markdown recommendations
+- `autoPublishEligibility` with reasons when instant listing is blocked
 
 If no category can be determined, the Worker returns:
 
@@ -125,26 +131,43 @@ Optional overrides:
 
 If `categoryId` is provided, it is used instead of the auto-selected category. If `itemSpecifics` are provided, they are merged over the AI-detected values and validated against eBay's required aspects for the category.
 
-Returns the draft with:
+Returns the draft with an unpublished eBay offer:
 
 ```json
 {
-  "status": "ebay_listing_published",
+  "status": "ready_to_publish_later",
   "publishEnabled": true,
   "ebayInventoryItem": {
     "sku": "draft-..."
   },
   "ebayOffer": {
     "offerId": "...",
-    "status": "published"
-  },
-  "ebayListing": {
-    "listingId": "..."
+    "status": "draft"
   }
 }
 ```
 
-Repeating `/approve` for a draft that already has a `listingId` reuses the saved listing metadata. If a draft has an `offerId` but no `listingId`, `/approve` publishes that existing offer instead of creating a duplicate.
+Repeating `/approve` for a draft that already has an offer reuses the saved offer metadata instead of creating a duplicate. `/approve` does not publish.
+
+### `POST /publish`
+
+Accepts:
+
+```json
+{ "draftId": "..." }
+```
+
+Publishes an existing eBay offer created by `/approve`. If the draft does not have an `offerId`, the Worker returns `409 offer_required`.
+
+### `POST /instant-list`
+
+Accepts:
+
+```json
+{ "draftId": "..." }
+```
+
+Loads the saved draft, checks `autoPublishEligibility`, creates an unpublished offer if needed, then publishes it. If the draft is not eligible, the Worker returns `409 instant_list_not_eligible` with reasons.
 
 ## Category and Item Specifics
 
@@ -183,7 +206,7 @@ It then merges AI-detected item specifics with `Brand`, `MPN`, `Model`, and manu
 }
 ```
 
-This payload is returned, saved as a draft, and used by `/approve` to create the eBay Inventory item, create the offer, and publish it.
+This payload is returned, saved as a draft, and used by `/approve` to create the eBay Inventory item and unpublished offer.
 
 ## eBay Draft Creation
 
@@ -192,10 +215,15 @@ This payload is returned, saved as a draft, and used by `/approve` to create the
 ```text
 PUT https://api.ebay.com/sell/inventory/v1/inventory_item/{sku}
 POST https://api.ebay.com/sell/inventory/v1/offer
+```
+
+`POST /publish` calls:
+
+```text
 POST https://api.ebay.com/sell/inventory/v1/offer/{offerId}/publish
 ```
 
-The `publishOffer` response is saved as `draft.ebayListing`, including the returned `listingId` when eBay provides one.
+The `publishOffer` response is saved as `draft.ebayListing`, including the returned `listingId` when eBay provides one. `/instant-list` may call both flows, but only after `autoPublishEligibility.eligible` is true.
 
 Required for `/approve`:
 
@@ -258,11 +286,13 @@ The Worker uses layered active eBay Browse API searches instead of a single comp
 
 Each active comp is normalized with item price, shipping when available, total price, condition, seller, category ids, query used, match score, and reject reason. The scorer favors exact MPN/model/brand/category matches and filters out likely wrong comps such as manuals, box-only listings, repair listings, bundles, lots, and conflicting part numbers. `open box` is allowed.
 
-`priceMode` controls the final price:
+The Worker chooses `priceMode` unless the Shortcut or caller explicitly provides one:
 
 - `fast_sale`: prices below the reliable median for faster movement.
 - `market`: prices close to the reliable median.
 - `premium`: defaults to a higher price, with scarcity upside when exact active comps are limited.
+
+Premium industrial brands include Allen-Bradley, Rockwell, Siemens, Keyence, Omron, Banner, Schmersal, Danfoss, Lenze, Marel, Ishida, Secomea, and Phoenix Contact. Premium brand pricing may allow scarcity upside up to 25%. Unknown or nonindustrial brands use a lower scarcity cap and fall back to market pricing when exact comps are not available.
 
 Condition adjustments are applied after comp pricing:
 
@@ -277,6 +307,14 @@ Condition adjustments are applied after comp pricing:
 Final prices are rounded to eBay-style endings such as `189.99`, `849.99`, or `1299`.
 
 If `SERPAPI_KEY` is configured, the Worker also searches for sold/completed eBay result signals through SerpAPI. Sold exact comps are weighted highest, then exact active comps, then weaker sold and active comps. If SerpAPI is missing or fails, the draft still succeeds and the issue is recorded in `pricing.pricingWarnings`.
+
+Pricing confidence controls saved draft behavior:
+
+- `< 0.45`: `status` becomes `pricing_review_required`, `publishEnabled` stays `false`, and a low-confidence warning is added.
+- `0.45` to `< 0.7`: approval is allowed, with a moderate-confidence warning.
+- `>= 0.7`: approval is allowed normally.
+
+Each draft also includes `listingStrategy`, a saved recommendation only. Premium exact industrial parts hold price for 14 days, then consider 5% and later 5-10% reductions if interest is weak. Market mode reviews after 7 days and may reduce 5% after 14 days. Fast sale mode recommends 5% after 7 days and 10% after 14 days.
 
 ## Cloudflare Setup
 
@@ -390,11 +428,16 @@ Create a Shortcut that:
 2. Sends a `POST` request to `https://ebay-prefill-worker.mmarshalleet.workers.dev/draft`.
 3. Sets the request body to `Form`.
 4. Adds each selected photo under the form key `images`.
-5. Optionally adds text fields named `notes`, `condition`, `quantity`, `ocrText`, and `priceMode`.
-6. Reads the JSON response and presents it for review.
-7. If the response contains `missingRequiredAspects`, asks for those values and sends them back to `/approve` as `itemSpecifics`.
+5. Optionally adds text fields named `ocrText`, `notes`, and `quantity`.
+6. Reads the JSON response and presents the title, condition, suggested price, confidence, and `listingStrategy.reason`.
+7. Lets the user choose Approve Draft, Publish, or the optional power-user Instant List path when eligible.
 
 For better identification and comp search, add an OCR step in the Shortcut and pass recognized text as `ocrText`. The Worker tells OpenAI to treat OCR as a likely source for catalog numbers, MPNs, model numbers, manufacturer names, voltage, and part numbers, while ignoring obvious serial numbers unless they help identify the product family. The eBay comp search query is built from MPN, model, brand, title, and exact OCR-looking part numbers.
+
+The Worker handles condition and price mode automatically unless a manual override is provided. Overrides are optional fields for advanced use only:
+
+- `condition`
+- `priceMode`
 
 Example Shortcut form fields:
 
@@ -402,12 +445,18 @@ Example Shortcut form fields:
 images: selected photos
 ocrText: Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16
 notes: Includes factory box
-condition: New Open Box
 quantity: 1
-priceMode: premium
 ```
 
-To approve and publish a draft, send JSON to `/approve`:
+Recommended Shortcut flow:
+
+1. `POST /draft`
+2. Show draft title, condition, suggested price, confidence, and `listingStrategy.reason`
+3. Approve Draft: `POST /approve`
+4. Publish: `POST /publish`
+5. Optional power-user path: `POST /instant-list` only if `autoPublishEligibility.eligible` is true
+
+To approve a draft and create an unpublished offer, send JSON to `/approve`:
 
 ```json
 { "draftId": "the-id-from-draft-response" }
@@ -427,7 +476,13 @@ To supply missing values or override the category, send:
 }
 ```
 
-This approval step publishes the eBay listing.
+To publish the approved offer, send:
+
+```json
+{ "draftId": "the-id-from-draft-response" }
+```
+
+to `/publish`.
 
 ## Local Smoke Tests
 
@@ -444,10 +499,8 @@ curl -X POST http://localhost:8787/draft \
   -F "images=@/path/to/photo1.jpg" \
   -F "images=@/path/to/photo2.jpg" \
   -F "notes=Includes box and charger" \
-  -F "condition=Used" \
   -F "quantity=1" \
-  -F "ocrText=Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16" \
-  -F "priceMode=premium"
+  -F "ocrText=Allen-Bradley 1756-IB16 Input Module CAT NO 1756-IB16"
 ```
 
 Fetch a draft:
@@ -456,10 +509,26 @@ Fetch a draft:
 curl "http://localhost:8787/draft?id=your-draft-id"
 ```
 
-Approve and publish:
+Approve and create unpublished offer:
 
 ```bash
 curl -X POST http://localhost:8787/approve \
+  -H "Content-Type: application/json" \
+  -d "{\"draftId\":\"your-draft-id\"}"
+```
+
+Publish existing offer:
+
+```bash
+curl -X POST http://localhost:8787/publish \
+  -H "Content-Type: application/json" \
+  -d "{\"draftId\":\"your-draft-id\"}"
+```
+
+Instant list only when eligible:
+
+```bash
+curl -X POST http://localhost:8787/instant-list \
   -H "Content-Type: application/json" \
   -d "{\"draftId\":\"your-draft-id\"}"
 ```
