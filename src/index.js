@@ -172,47 +172,58 @@ async function createDraft(request, env) {
   requireSecret(env, "EBAY_CLIENT_SECRET");
 
 async function publishDraft(request, env) {
-  const body = await request.json();
-  const draftId = body?.draftId;
+  requireBinding(env, "DRAFT_KV");
+  requireSecret(env, "EBAY_TOKEN");
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "invalid_json", message: "POST /publish requires JSON." }, 400);
+  }
+
+  const draftId = typeof body?.draftId === "string" ? body.draftId.trim() : "";
 
   if (!draftId) {
-    return new Response(JSON.stringify({ error: "missing_draft_id" }), { status: 400 });
+    return jsonResponse({ error: "missing_draft_id", message: "Expected { \"draftId\": \"...\" }." }, 400);
   }
 
   const draft = await env.DRAFT_KV.get(draftId, { type: "json" });
 
   if (!draft) {
-    return new Response(JSON.stringify({ error: "draft_not_found" }), { status: 404 });
+    return jsonResponse({ error: "draft_not_found" }, 404);
   }
 
   const offerId = draft?.ebayOffer?.offerId;
 
   if (!offerId) {
-    return new Response(JSON.stringify({ error: "missing_offer_id" }), { status: 400 });
+    return jsonResponse({ error: "missing_offer_id", message: "Approve the draft before publishing." }, 400);
   }
 
-  const publishResult = await publishEbayOffer({
-    offerId,
-    env
-  });
+  const publishResult = await publishEbayOffer({ offerId, env });
+  const listingId = stringValue(publishResult.listingId);
 
   const updatedDraft = {
     ...draft,
     status: "ebay_listing_published",
     publishEnabled: false,
+    ebayOffer: {
+      ...draft.ebayOffer,
+      status: "published"
+    },
     ebayListing: {
-      listingId: publishResult.listingId
+      listingId,
+      raw: publishResult
     },
     updatedAt: new Date().toISOString()
   };
 
   await env.DRAFT_KV.put(draftId, JSON.stringify(updatedDraft));
 
-  return new Response(JSON.stringify(updatedDraft), {
-    headers: { "Content-Type": "application/json" }
-  });
+  return jsonResponse(updatedDraft);
 }
 
+  
   const contentType = request.headers.get("Content-Type") || "";
   if (!contentType.includes("multipart/form-data")) {
     return jsonResponse({ error: "invalid_content_type", message: "POST /draft requires multipart/form-data." }, 415);
@@ -659,7 +670,8 @@ async function createAndPublishEbayOffer(draft, env) {
       updatedAt: new Date().toISOString()
     };
   }
-async function createEbayOfferDraftOnly(draft, env) {
+ };
+  async function createEbayOfferDraftOnly(draft, env) {
   if (draft.ebayListing?.listingId) {
     return {
       ...draft,
@@ -669,62 +681,44 @@ async function createEbayOfferDraftOnly(draft, env) {
     };
   }
 
-  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice;
-
-  if (!suggestedPrice) {
+  if (draft.ebayOffer?.offerId) {
     return {
       ...draft,
-      status: "price_required",
-      publishEnabled: false
+      status: "ebay_offer_draft_created",
+      publishEnabled: true,
+      updatedAt: new Date().toISOString()
     };
   }
 
-  const sku = draft.sku || `draft-${Date.now()}`;
+  const suggestedPrice = draft.pricing?.suggestedPrice ?? draft.suggestedPrice ?? null;
 
-  const inventoryItemPayload = buildEbayInventoryItemPayload(draft);
+  if (!isPositiveNumber(suggestedPrice)) {
+    return {
+      ...draft,
+      status: "price_required",
+      publishEnabled: false,
+      ebayOfferWarnings: ["No suggested price is available, so an eBay offer draft was not created."],
+      updatedAt: new Date().toISOString()
+    };
+  }
 
-  await putEbayInventoryItem({
-    sku,
-    payload: inventoryItemPayload,
-    env
-  });
-
-  const offerPayload = buildEbayOfferPayload(draft, sku, suggestedPrice, env);
-
-  const offer = await createEbayOffer({
-    payload: offerPayload,
-    env
-  });
-
-  return {
-    ...draft,
-    sku,
-    status: "ebay_offer_draft_created",
-    publishEnabled: true,
-    ebayOffer: {
-      offerId: offer.offerId,
-      status: "unpublished"
-    },
-    updatedAt: new Date().toISOString()
-  };
-}
   const sku = draft.sku || buildSku(draft);
   const inventoryItemPayload = buildEbayInventoryItemPayload(draft);
+
   await putEbayInventoryItem({ sku, payload: inventoryItemPayload, env });
 
   const offerPayload = buildEbayOfferPayload(draft, sku, suggestedPrice, env);
   const offer = await createEbayOffer({ payload: offerPayload, env });
   const offerId = stringValue(offer.offerId);
+
   if (!offerId) {
     throw new Error("eBay Inventory createOffer did not return an offerId.");
   }
-  const publishResult = await publishEbayOffer({ offerId, env });
-  const listingId = stringValue(publishResult.listingId);
 
   return {
     ...draft,
     sku,
-    status: "ebay_listing_published",
+    status: "ebay_offer_draft_created",
     publishEnabled: true,
     ebayInventoryItem: {
       sku,
@@ -733,10 +727,36 @@ async function createEbayOfferDraftOnly(draft, env) {
     },
     ebayOffer: {
       offerId,
-      status: "published",
+      status: "unpublished",
       publishEnabled: true,
       payload: offerPayload,
       raw: offer
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function createAndPublishEbayOffer(draft, env) {
+  const draftWithOffer = await createEbayOfferDraftOnly(draft, env);
+
+  if (!draftWithOffer.ebayOffer?.offerId) {
+    return draftWithOffer;
+  }
+
+  const publishResult = await publishEbayOffer({
+    offerId: draftWithOffer.ebayOffer.offerId,
+    env
+  });
+
+  const listingId = stringValue(publishResult.listingId);
+
+  return {
+    ...draftWithOffer,
+    status: "ebay_listing_published",
+    publishEnabled: false,
+    ebayOffer: {
+      ...draftWithOffer.ebayOffer,
+      status: "published"
     },
     ebayListing: {
       listingId,
