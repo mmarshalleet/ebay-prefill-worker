@@ -439,7 +439,7 @@ async function identifyItemWithOpenAI(apiKey, imageParts, input) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "gpt-5.3",
+      model: "gpt-4o"",
       input: [
         {
           role: "user",
