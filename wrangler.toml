@@ -18,3 +18,18 @@ preview_id = "363498ff7e264a83bd86186249377efe"
 binding = "IMAGES"
 bucket_name = "ebay-images"
 preview_bucket_name = "ebay-images"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
