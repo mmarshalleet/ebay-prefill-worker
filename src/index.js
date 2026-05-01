@@ -1010,9 +1010,9 @@ function determineCondition({ aiCondition, userCondition, ocrText, notes, title 
   }
 
   return {
-    condition: "Used",
+    condition: "New Open Box",
     source: "fallback",
-    signals: ["No explicit condition signal found; defaulted to Used."]
+    signals: ["No explicit condition signal found; defaulted to New Open Box."]
   };
 }
 
