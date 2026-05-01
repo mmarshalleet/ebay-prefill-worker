@@ -10,53 +10,27 @@ const JSON_HEADERS = {
   ...CORS_HEADERS
 };
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token";
 const EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search";
 const EBAY_TAXONOMY_TREE_URL = "https://api.ebay.com/commerce/taxonomy/v1/category_tree/0";
 const EBAY_INVENTORY_URL = "https://api.ebay.com/sell/inventory/v1";
 const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope";
 
-const listingSchema = {
-  type: "object",
-  properties: {
-    title: { type: "string" },
-    brand: { type: "string" },
-    model: { type: "string" },
-    mpn: { type: "string" },
-    condition: { type: "string" },
-    categoryHint: { type: "string" },
-    itemSpecifics: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          value: { type: "string" }
-        },
-        required: ["name", "value"],
-        additionalProperties: false
-      }
-    },
-    descriptionBullets: {
-      type: "array",
-      items: { type: "string" }
-    },
-    confidence: { type: "number" }
-  },
-  required: [
-    "title",
-    "brand",
-    "model",
-    "mpn",
-    "condition",
-    "categoryHint",
-    "itemSpecifics",
-    "descriptionBullets",
-    "confidence"
-  ],
-  additionalProperties: false
-};
+const KNOWN_BRANDS = [
+  "Allen-Bradley",
+  "Rockwell",
+  "Siemens",
+  "Keyence",
+  "Omron",
+  "Banner",
+  "Schmersal",
+  "Danfoss",
+  "Lenze",
+  "Phoenix Contact",
+  "Marel",
+  "Ishida",
+  "Secomea"
+];
 
 class ExternalApiError extends Error {
   constructor(service, status, payload) {
@@ -141,8 +115,6 @@ export default {
 
 async function createDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
-  requireBinding(env, "IMAGES");
-  requireSecret(env, "OPENAI_API_KEY");
   requireSecret(env, "EBAY_CLIENT_ID");
   requireSecret(env, "EBAY_CLIENT_SECRET");
 
@@ -153,58 +125,28 @@ async function createDraft(request, env) {
 
   const formData = await request.formData();
   const imageFiles = formData.getAll("images").filter((value) => value instanceof File);
-
-  if (imageFiles.length === 0) {
-    return jsonResponse({ error: "missing_images", message: "Upload one or more files with the form key images." }, 400);
-  }
-
   const notes = stringField(formData, "notes");
   const userCondition = stringField(formData, "condition");
-  const ocrText = stringField(formData, "ocrText");
+  const ocrText = stringField(formData, "ocrText") || "";
   const quantity = positiveIntegerField(formData, "quantity", 1);
   const userPriceMode = parseUserPriceMode(stringField(formData, "priceMode"));
   const cost = optionalNumberField(formData, "cost");
   const desiredMarginPercent = optionalNumberField(formData, "desiredMarginPercent");
   const draftId = crypto.randomUUID();
   const now = new Date().toISOString();
-  const imageHostResult = await hostUploadedImages({
-    imageFiles,
-    draftId,
+  const imageHostResult = imageFiles.length > 0
+    ? await hostUploadedImages({ imageFiles, draftId, env })
+    : { imageUrls: [], hostedImages: [], imageHostWarnings: [] };
+  const ebayToken = await getEbayToken(env);
+  const identification = await identifyItemFromOcrAndEbay({
+    ocrText,
+    notes,
+    userCondition,
+    token: ebayToken,
     env
   });
-  const images = await Promise.all(imageFiles.map(fileToOpenAIImagePart));
-
-  let identification;
-  try {
-    identification = await identifyItemWithOpenAI(env.OPENAI_API_KEY, images, {
-      notes,
-      condition: userCondition,
-      quantity,
-      ocrText
-    });
-  } catch (error) {
-    if (error instanceof ExternalApiError) {
-      return jsonResponse({
-        error: "openai_identification_failed",
-        service: error.service,
-        status: error.status,
-        message: error.message,
-        raw: error.payload
-      }, 502);
-    }
-
-    return jsonResponse({
-      error: "openai_identification_failed",
-      message: error instanceof Error ? error.message : "OpenAI identification failed."
-    }, 502);
-  }
-
-  identification = enrichIdentificationWithExtractedPartNumbers(identification, {
-    notes,
-    ocrText
-  });
   const conditionDecision = determineCondition({
-    aiCondition: identification.condition,
+    aiCondition: "",
     userCondition,
     ocrText,
     notes,
@@ -225,7 +167,6 @@ async function createDraft(request, env) {
   });
   const brandStrategy = getBrandStrategy(identification.brand);
 
-  const ebayToken = await getEbayToken(env);
   const pricingInputs = {
     priceMode: priceModeDecision.priceMode,
     cost,
@@ -269,6 +210,8 @@ async function createDraft(request, env) {
     priceModeSignals: priceModeDecision.signals,
     brandStrategy,
     pricingInputs,
+    price: null,
+    suggestedPrice: null,
     identification,
     ebaySearch: {
       marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
@@ -286,6 +229,8 @@ async function createDraft(request, env) {
     saveDraft: true,
     successStatus: "draft",
     successHttpStatus: 201,
+    returnDraftOnMissingCategory: true,
+    returnDraftOnMissingAspects: true,
     enrichDraft: async (validatedDraft) => addPricingToDraft(validatedDraft, {
       env,
       token: ebayToken,
@@ -364,6 +309,129 @@ async function approveDraft(request, env) {
   });
 }
 
+async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token, env }) {
+  const partNumbers = extractPartNumbers(`${ocrText}\n${notes}`);
+  const brand = inferBrand({ ocrText, notes, mpn: partNumbers.mpn });
+  const condition = determineCondition({
+    aiCondition: "",
+    userCondition,
+    ocrText,
+    notes,
+    title: ""
+  }).condition;
+  const searchQuery = buildInitialSearchQuery({ partNumbers, ocrText });
+  const draftForSearch = {
+    title: searchQuery,
+    brand,
+    model: partNumbers.model,
+    mpn: partNumbers.mpn,
+    condition,
+    ocrText,
+    extractedPartNumbers: partNumbers.candidates,
+    itemSpecifics: buildHeuristicItemSpecifics({ brand, mpn: partNumbers.mpn, model: partNumbers.model })
+  };
+  let firstEbayResult = null;
+
+  try {
+    const comps = await searchEbayComps(env, token, searchQuery, draftForSearch);
+    firstEbayResult = comps[0] || null;
+  } catch {
+    firstEbayResult = null;
+  }
+
+  const title = buildTitle({
+    brand,
+    mpn: partNumbers.mpn,
+    model: partNumbers.model,
+    categoryName: "Industrial Part",
+    condition,
+    fallbackTitle: firstEbayResult?.title
+  });
+
+  return {
+    title,
+    brand,
+    model: partNumbers.model,
+    mpn: partNumbers.mpn,
+    condition,
+    categoryHint: "Industrial automation part",
+    itemSpecifics: buildHeuristicItemSpecifics({ brand, mpn: partNumbers.mpn, model: partNumbers.model }),
+    descriptionBullets: buildHeuristicDescriptionBullets({ brand, mpn: partNumbers.mpn, model: partNumbers.model, condition }),
+    confidence: partNumbers.mpn || firstEbayResult ? 0.65 : 0.15,
+    extractedPartNumbers: partNumbers.candidates,
+    searchQuery,
+    ebayTitleFallback: firstEbayResult?.title || ""
+  };
+}
+
+function buildInitialSearchQuery({ partNumbers, ocrText }) {
+  return firstNonEmpty([
+    partNumbers.mpn,
+    partNumbers.model,
+    cleanOcrSearchText(ocrText),
+    "industrial automation part"
+  ]);
+}
+
+function cleanOcrSearchText(ocrText) {
+  const cleaned = stringValue(ocrText)
+    .replace(/[^\w./\-\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return dedupeWords([cleaned], 12);
+}
+
+function inferBrand({ ocrText, notes, mpn }) {
+  const text = joinSignalText([ocrText, notes]);
+  const knownBrand = KNOWN_BRANDS.find((brand) => text.includes(brand.toLowerCase()));
+  if (knownBrand) {
+    return knownBrand;
+  }
+
+  const prefix = stringValue(mpn).split(/[-\s]/)[0] || "";
+  if (/^[a-z]{2,}/i.test(prefix)) {
+    return prefix.toUpperCase();
+  }
+
+  return "";
+}
+
+function buildTitle({ brand, mpn, model, categoryName, condition, fallbackTitle }) {
+  const hasIdentifier = Boolean(firstNonEmpty([brand, mpn, model]));
+  const generated = dedupeWords([
+    brand,
+    mpn,
+    !mpn || model !== mpn ? model : "",
+    categoryName,
+    condition
+  ], 14);
+
+  return truncateText(firstNonEmpty([
+    hasIdentifier ? generated : "",
+    fallbackTitle,
+    generated,
+    "Unknown Industrial Part"
+  ]), 80);
+}
+
+function buildHeuristicItemSpecifics({ brand, mpn, model }) {
+  return normalizeItemSpecifics({
+    Brand: brand,
+    MPN: mpn,
+    Model: model
+  });
+}
+
+function buildHeuristicDescriptionBullets({ brand, mpn, model, condition }) {
+  return uniqueNonEmpty([
+    brand ? `Brand: ${brand}` : "",
+    mpn ? `MPN: ${mpn}` : "",
+    model ? `Model: ${model}` : "",
+    condition ? `Condition: ${condition}` : ""
+  ]);
+}
+
 async function publishDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
   requireSecret(env, "EBAY_TOKEN");
@@ -439,7 +507,18 @@ async function instantListDraft(request, env) {
   return jsonResponse(publishedDraft);
 }
 
-async function validateCategoryAndAspects({ draft, token, env, saveDraft, successStatus, successHttpStatus, enrichDraft, afterValidDraft }) {
+async function validateCategoryAndAspects({
+  draft,
+  token,
+  env,
+  saveDraft,
+  successStatus,
+  successHttpStatus,
+  returnDraftOnMissingCategory = false,
+  returnDraftOnMissingAspects = false,
+  enrichDraft,
+  afterValidDraft
+}) {
   const categoryQuery = buildCategoryQuery(draft);
   let categoryId = draft.categoryId || "";
 
@@ -459,6 +538,10 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
 
       if (saveDraft) {
         await saveDraftToKv(env, missingCategoryDraft);
+      }
+
+      if (returnDraftOnMissingCategory) {
+        return jsonResponse(missingCategoryDraft, successHttpStatus);
       }
 
       return jsonResponse({
@@ -512,7 +595,7 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
     await saveDraftToKv(env, validatedDraft);
   }
 
-  if (aspectResult.missingRequiredAspects.length > 0) {
+  if (aspectResult.missingRequiredAspects.length > 0 && !returnDraftOnMissingAspects) {
     return jsonResponse({
       error: "missing_required_item_specifics",
       categoryId: validatedDraft.categoryId,
@@ -527,59 +610,9 @@ async function validateCategoryAndAspects({ draft, token, env, saveDraft, succes
   return jsonResponse(validatedDraft, successHttpStatus);
 }
 
-async function identifyItemWithOpenAI(apiKey, imageParts, input) {
-  const prompt = [
-    "Identify this resale item for an eBay listing draft.",
-    "Return ONLY valid JSON matching the requested schema.",
-    "Use empty strings when a brand, model, or MPN cannot be determined.",
-    "Use itemSpecifics as concise eBay-style name/value facts visible or strongly inferable from the photos.",
-    "Image OCR text may contain model, MPN, serial, voltage, part number, manufacturer, or catalog number.",
-    "Prefer exact catalog and MPN values from OCR text when they are visible.",
-    "Ignore obvious serial numbers unless they are useful for identifying the product family.",
-    "Return OCR-derived fields in itemSpecifics when relevant.",
-    "Keep the title under 80 characters and avoid unsupported claims.",
-    `Seller notes: ${input.notes || "none"}`,
-    `Seller condition hint: ${input.condition || "none"}`,
-    `Quantity: ${input.quantity}`,
-    `Image OCR text:\n${truncateForPrompt(input.ocrText || "none", 12000)}`
-  ].join("\n");
-
-  const response = await fetch(OPENAI_RESPONSES_URL, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      input: [
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: prompt },
-            ...imageParts
-          ]
-        }
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "ebay_listing_identification",
-          strict: true,
-          schema: listingSchema
-        }
-      }
-    })
-  });
-
-  const payload = await parseJsonResponse(response, "OpenAI");
-  const text = extractOpenAIText(payload);
-  const parsed = safeJsonParse(text);
-
-  return normalizeIdentification(parsed);
-}
-
 async function hostUploadedImages({ imageFiles, draftId, env }) {
+  requireBinding(env, "IMAGES");
+
   const imageUrls = [];
   const hostedImages = [];
   const imageHostWarnings = [];
@@ -910,9 +943,9 @@ function determineCondition({ aiCondition, userCondition, ocrText, notes, title 
 
   const text = joinSignalText([ocrText, notes, title]);
   const explicitSignals = [
-    { condition: "New Sealed", patterns: ["factory sealed", "new sealed", "never opened", "sealed"] },
-    { condition: "Open Box", patterns: ["open box", "new other", "unused", "new without box", "shelf spare"] },
     { condition: "For Parts", patterns: ["for parts", "not working", "repair", "damaged", "broken"] },
+    { condition: "Open Box", patterns: ["open box", "new other", "unused", "new without box", "shelf spare"] },
+    { condition: "New", patterns: ["factory sealed", "new sealed", "never opened", "sealed", "new"] },
     { condition: "Used Tested", patterns: ["tested", "working pull", "pulled from working equipment"] }
   ];
 
@@ -956,7 +989,7 @@ function determinePriceMode({ userPriceMode, condition, brand, mpn, ocrText, not
   const signals = [];
   const text = joinSignalText([ocrText, notes]);
   const brandStrategy = getBrandStrategy(brand);
-  const exactMpn = hasStrongMpn(mpn) || extractPartNumbers(`${mpn} ${ocrText}`).some(hasStrongMpn);
+  const exactMpn = hasStrongMpn(mpn) || extractPartNumberCandidates(`${mpn} ${ocrText}`).some(hasStrongMpn);
 
   if (/\b(quick sale|move fast|clearance|liquidate)\b/.test(text)) {
     return {
@@ -1204,6 +1237,7 @@ async function addPricingToDraft(draft, { env, token, priceMode, cost, desiredMa
     ...draft,
     status: pricingPolicy.status || draft.status,
     publishEnabled: pricingPolicy.publishEnabled,
+    price: pricing.suggestedPrice,
     suggestedPrice: pricing.suggestedPrice,
     pricing: pricingPolicy.pricing,
     ebaySearch: {
@@ -1257,12 +1291,12 @@ function buildEbaySearchCandidates(draft) {
   const mpn = firstNonEmpty([
     draft.mpn,
     draft.identification?.mpn,
-    ...extractPartNumbers(draft.mpn || "")
+    ...extractPartNumberCandidates(draft.mpn || "")
   ]);
   const brand = firstNonEmpty([draft.brand, draft.identification?.brand]);
   const model = firstNonEmpty([draft.model, draft.identification?.model]);
   const title = firstNonEmpty([draft.title, draft.identification?.title]);
-  const ocrPartNumbers = extractPartNumbers(draft.ocrText || draft.input?.ocrText || "");
+  const ocrPartNumbers = extractPartNumberCandidates(draft.ocrText || draft.input?.ocrText || "");
 
   return uniqueNonEmpty([
     mpn && brand ? dedupeWords([mpn, brand], 8) : "",
@@ -1602,7 +1636,7 @@ function scoreCompMatch(comp, draft) {
   const draftBrand = firstNonEmpty([draft.brand, draft.identification?.brand]);
   const draftCondition = draft.input?.requestedCondition || draft.condition || draft.identification?.condition;
   const draftParts = getDraftPartNumbers(draft);
-  const titleParts = extractPartNumbers(title);
+  const titleParts = extractPartNumberCandidates(title);
   let score = 0;
   let rejectReason = null;
 
@@ -1687,6 +1721,7 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
   }
 
   if (pricingComps.length === 0) {
+    const noCompsFound = acceptedActive.length + acceptedSold.length === 0;
     warnings.push("No accepted comps remained after scoring and filtering.");
     return {
       mode,
@@ -1697,7 +1732,7 @@ function calculateSuggestedPrice({ draft, activeComps, soldComps, priceMode, cos
       activeMedian: medianPrice(acceptedActive),
       soldMedian: medianPrice(acceptedSold),
       priceConfidence: 0,
-      pricingReason: "No reliable comps were available after filtering.",
+      pricingReason: noCompsFound ? "No comps found" : "No reliable comps were available after filtering.",
       pricingWarnings: warnings,
       compCount: 0,
       exactCompCount: 0,
@@ -1788,11 +1823,19 @@ function buildEbaySearchQuery(identification, ocrText = "") {
     identification.model,
     identification.brand,
     identification.title,
-    ...extractPartNumbers(ocrText)
+    ...extractPartNumberCandidates(ocrText)
   ], 18);
 }
 
 function extractPartNumbers(text) {
+  const candidates = extractPartNumberCandidates(text);
+  const mpn = candidates[0] || "";
+  const model = candidates.find((candidate) => candidate !== mpn) || mpn;
+
+  return { mpn, model, candidates };
+}
+
+function extractPartNumberCandidates(text) {
   const sourceText = stringValue(text);
   if (!sourceText) {
     return [];
@@ -1801,6 +1844,8 @@ function extractPartNumbers(text) {
   const candidates = [];
   const labeledValuePattern = /\b(?:mpn|m\.?p\.?n\.?|model(?:\s*(?:no\.?|number|#))?|part(?:\s*(?:no\.?|number|#))?|p\/n|pn|catalog(?:\s*(?:no\.?|number|#))?|cat(?:\.|\s)*(?:no\.?|number|#)?|mfr(?:\s+part)?(?:\s*(?:no\.?|number|#))?|manufacturer\s+part(?:\s*(?:no\.?|number|#))?)\s*[:#-]?\s*([a-z0-9][a-z0-9._/\-\s]{2,})/gi;
   const siemensPattern = /\b\d[a-z]{2}\d\s+\d{3}-[a-z0-9]{4,}-[a-z0-9]{3,}\b/gi;
+  const requestedHyphenatedPattern = /\b[A-Z0-9]{2,}-[A-Z0-9\-]+\b/gi;
+  const requestedCompactPattern = /\b[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b/gi;
   const hyphenatedPattern = /\b[a-z0-9]{2,}(?:[-/][a-z0-9]{2,})+\b/gi;
   const compactPattern = /\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{5,}\b/gi;
 
@@ -1818,7 +1863,7 @@ function extractPartNumbers(text) {
       continue;
     }
 
-    for (const pattern of [siemensPattern, hyphenatedPattern, compactPattern]) {
+    for (const pattern of [siemensPattern, requestedHyphenatedPattern, requestedCompactPattern, hyphenatedPattern, compactPattern]) {
       for (const match of line.matchAll(pattern)) {
         candidates.push(cleanPartNumber(match[0]));
       }
@@ -1843,37 +1888,6 @@ function isLikelyMeasurement(value) {
   return /^\d+(?:\.\d+)?(?:v|vac|vdc|a|amp|amps|hz|w|kw|hp|ma|dc|ac)$/i.test(value);
 }
 
-function enrichIdentificationWithExtractedPartNumbers(identification, input) {
-  const extractedPartNumbers = extractPartNumbers([
-    identification.title,
-    identification.brand,
-    identification.model,
-    identification.mpn,
-    input.notes,
-    input.ocrText,
-    ...normalizeItemSpecifics(identification.itemSpecifics).map((specific) => `${specific.name} ${specific.value}`)
-  ].join("\n"));
-  const primaryPartNumber = extractedPartNumbers[0] || "";
-  const enriched = {
-    ...identification,
-    mpn: identification.mpn || primaryPartNumber,
-    model: identification.model || primaryPartNumber,
-    extractedPartNumbers
-  };
-  const specifics = normalizeItemSpecifics(identification.itemSpecifics);
-
-  if (primaryPartNumber && !specifics.some((specific) => aspectKey(specific.name) === aspectKey("MPN"))) {
-    specifics.push({ name: "MPN", value: primaryPartNumber });
-  }
-
-  if (primaryPartNumber && !specifics.some((specific) => aspectKey(specific.name) === aspectKey("Model"))) {
-    specifics.push({ name: "Model", value: primaryPartNumber });
-  }
-
-  enriched.itemSpecifics = specifics;
-  return enriched;
-}
-
 function getDraftPartNumbers(draft) {
   return uniqueNonEmpty([
     draft.mpn,
@@ -1881,11 +1895,11 @@ function getDraftPartNumbers(draft) {
     draft.identification?.mpn,
     draft.identification?.model,
     ...(Array.isArray(draft.extractedPartNumbers) ? draft.extractedPartNumbers : []),
-    ...extractPartNumbers(draft.ocrText || draft.input?.ocrText || ""),
-    ...extractPartNumbers(draft.title || draft.identification?.title || ""),
+    ...extractPartNumberCandidates(draft.ocrText || draft.input?.ocrText || ""),
+    ...extractPartNumberCandidates(draft.title || draft.identification?.title || ""),
     ...normalizeItemSpecifics(draft.itemSpecifics || draft.identification?.itemSpecifics || [])
       .filter((specific) => ["mpn", "model", "manufacturer part number", "catalog number"].includes(specific.name.toLowerCase()))
-      .flatMap((specific) => extractPartNumbers(specific.value).concat(specific.value))
+      .flatMap((specific) => extractPartNumberCandidates(specific.value).concat(specific.value))
   ]);
 }
 
@@ -2233,10 +2247,10 @@ function isPositiveNumber(value) {
 
 function buildCategoryQuery(draft) {
   return dedupeWords([
-    draft.title || draft.identification?.title,
-    draft.brand || draft.identification?.brand,
-    draft.model || draft.identification?.model,
     draft.mpn || draft.identification?.mpn,
+    draft.title || draft.identification?.title,
+    draft.model || draft.identification?.model,
+    draft.brand || draft.identification?.brand,
     draft.categoryHint || draft.identification?.categoryHint
   ], 16);
 }
@@ -2270,54 +2284,6 @@ function buildEbayInventoryItemDraft(draft, aspects) {
   return inventoryDraft;
 }
 
-async function fileToOpenAIImagePart(file) {
-  const mimeType = file.type || "application/octet-stream";
-  if (!mimeType.startsWith("image/")) {
-    throw new Error(`Unsupported upload type for ${file.name || "image"}: ${mimeType}`);
-  }
-
-  const bytes = await file.arrayBuffer();
-  const base64 = arrayBufferToBase64(bytes);
-
-  return {
-    type: "input_image",
-    image_url: `data:${mimeType};base64,${base64}`,
-    detail: "high"
-  };
-}
-
-function extractOpenAIText(payload) {
-  if (typeof payload.output_text === "string" && payload.output_text.trim()) {
-    return payload.output_text;
-  }
-
-  const output = Array.isArray(payload.output) ? payload.output : [];
-  for (const item of output) {
-    const content = Array.isArray(item.content) ? item.content : [];
-    for (const part of content) {
-      if (typeof part.text === "string" && part.text.trim()) {
-        return part.text;
-      }
-    }
-  }
-
-  throw new Error("OpenAI response did not contain text output.");
-}
-
-function safeJsonParse(text) {
-  const trimmed = String(text || "").trim();
-  const withoutFence = trimmed
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-
-  try {
-    return JSON.parse(withoutFence);
-  } catch (error) {
-    throw new Error(`OpenAI returned invalid JSON: ${error.message}`);
-  }
-}
-
 async function parseJsonResponse(response, serviceName) {
   const text = await response.text();
   let payload = {};
@@ -2335,26 +2301,6 @@ async function parseJsonResponse(response, serviceName) {
   }
 
   return payload;
-}
-
-function normalizeIdentification(value) {
-  if (!value || typeof value !== "object") {
-    throw new Error("OpenAI JSON was not an object.");
-  }
-
-  return {
-    title: stringValue(value.title),
-    brand: stringValue(value.brand),
-    model: stringValue(value.model),
-    mpn: stringValue(value.mpn),
-    condition: stringValue(value.condition),
-    categoryHint: stringValue(value.categoryHint),
-    itemSpecifics: normalizeItemSpecifics(value.itemSpecifics),
-    descriptionBullets: Array.isArray(value.descriptionBullets)
-      ? value.descriptionBullets.map(stringValue).filter(Boolean)
-      : [],
-    confidence: clampNumber(value.confidence, 0, 1)
-  };
 }
 
 function normalizeItemSpecifics(value) {
@@ -2641,14 +2587,6 @@ function stringValue(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function truncateForPrompt(value, maxLength) {
-  const text = stringValue(value);
-  if (text.length <= maxLength) {
-    return text;
-  }
-  return `${text.slice(0, maxLength)}\n[truncated]`;
-}
-
 function truncateText(value, maxLength) {
   const text = stringValue(value);
   return text.length > maxLength ? text.slice(0, maxLength) : text;
@@ -2688,17 +2626,4 @@ function jsonResponse(body, status = 200) {
     status,
     headers: JSON_HEADERS
   });
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
 }

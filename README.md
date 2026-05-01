@@ -1,6 +1,6 @@
 # eBay Photo Listing Draft Worker
 
-Cloudflare Worker for turning iOS Shortcut photo uploads into eBay listing drafts. It identifies the item with OpenAI Vision, determines condition and price mode server-side, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
+Cloudflare Worker for turning iOS Shortcut OCR and optional photo uploads into eBay listing drafts. It identifies the item from OCR text, heuristic part-number parsing, and eBay data, determines condition and price mode server-side, searches active fixed-price eBay Browse API comps, selects an eBay category with the Taxonomy API, checks required item specifics, suggests a price, stores the draft in KV, and returns JSON for review.
 
 Publishing is intentionally split into safety-gated steps. `POST /approve` creates or reuses an unpublished eBay Inventory item and offer. `POST /publish` publishes an existing offer. `POST /instant-list` is the only endpoint that can approve and publish in one request, and only when the saved draft is auto-publish eligible.
 
@@ -14,12 +14,9 @@ Returns service status and available endpoints.
 
 Accepts `multipart/form-data`.
 
-Required form field:
-
-- `images`: one or more image files
-
 Optional form fields:
 
+- `images`: one or more image files
 - `notes`
 - `ocrText`: text recognized by the Shortcut or another OCR step from labels, plates, stickers, or packaging
 - `quantity`
@@ -30,7 +27,7 @@ The Worker handles condition and price mode automatically unless those override 
 
 The response includes:
 
-- OpenAI item identification
+- OCR and eBay-based item identification
 - saved OCR text, when provided
 - hosted HTTPS image URLs from the R2 image bucket
 - eBay search query
@@ -358,7 +355,6 @@ Then set `R2_PUBLIC_BASE_URL` and the `[[r2_buckets]]` binding in `wrangler.toml
 Add secrets:
 
 ```bash
-npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put EBAY_CLIENT_ID
 npx wrangler secret put EBAY_CLIENT_SECRET
 npx wrangler secret put EBAY_TOKEN
@@ -432,7 +428,7 @@ Create a Shortcut that:
 6. Reads the JSON response and presents the title, condition, suggested price, confidence, and `listingStrategy.reason`.
 7. Lets the user choose Approve Draft, Publish, or the optional power-user Instant List path when eligible.
 
-For better identification and comp search, add an OCR step in the Shortcut and pass recognized text as `ocrText`. The Worker tells OpenAI to treat OCR as a likely source for catalog numbers, MPNs, model numbers, manufacturer names, voltage, and part numbers, while ignoring obvious serial numbers unless they help identify the product family. The eBay comp search query is built from MPN, model, brand, title, and exact OCR-looking part numbers.
+For better identification and comp search, add an OCR step in the Shortcut and pass recognized text as `ocrText`. The Worker treats OCR as the primary source for catalog numbers, MPNs, model numbers, manufacturer names, voltage, and part numbers, while ignoring obvious serial numbers unless they help identify the product family. The eBay comp search query is built from exact MPN, model, cleaned OCR text, then a generic industrial automation fallback.
 
 The Worker handles condition and price mode automatically unless a manual override is provided. Overrides are optional fields for advanced use only:
 
