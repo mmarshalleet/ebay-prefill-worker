@@ -119,8 +119,6 @@ export default {
 
 async function createDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
-  requireSecret(env, "EBAY_CLIENT_ID");
-  requireSecret(env, "EBAY_CLIENT_SECRET");
 
   const contentType = request.headers.get("Content-Type") || "";
   if (!contentType.includes("multipart/form-data")) {
@@ -141,13 +139,45 @@ async function createDraft(request, env) {
   const imageHostResult = imageFiles.length > 0
     ? await hostUploadedImages({ imageFiles, draftId, env })
     : { imageUrls: [], hostedImages: [], imageHostWarnings: [] };
+  const partNumbers = extractPartNumbers(`${ocrText}\n${notes}`);
+  const debug = buildDraftDebug({
+    ocrText,
+    extractedPartNumbers: partNumbers.candidates,
+    searchQueryUsed: hasStrongExtractedIdentifier(partNumbers)
+      ? buildInitialSearchQuery({ partNumbers, ocrText })
+      : "",
+    imageCount: imageFiles.length
+  });
+
+  if (!hasStrongExtractedIdentifier(partNumbers)) {
+    const reviewDraft = buildWeakOcrReviewDraft({
+      draftId,
+      now,
+      notes,
+      userCondition,
+      ocrText,
+      quantity,
+      userPriceMode,
+      cost,
+      desiredMarginPercent,
+      imageFiles,
+      imageHostResult,
+      partNumbers,
+      debug,
+      env
+    });
+    await saveDraftToKv(env, reviewDraft);
+    return jsonResponse(reviewDraft, 201);
+  }
+
   const ebayToken = await getEbayToken(env);
   let identification = await identifyItemFromOcrAndEbay({
     ocrText,
     notes,
     userCondition,
     token: ebayToken,
-    env
+    env,
+    partNumbers
   });
   const conditionDecision = determineCondition({
     aiCondition: "",
@@ -217,6 +247,8 @@ async function createDraft(request, env) {
     price: null,
     suggestedPrice: null,
     identification,
+    ocrTextPreview: buildOcrTextPreview(ocrText),
+    debug,
     ebaySearch: {
       marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
       query: "",
@@ -313,8 +345,8 @@ async function approveDraft(request, env) {
   });
 }
 
-async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token, env }) {
-  const partNumbers = extractPartNumbers(`${ocrText}\n${notes}`);
+async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token, env, partNumbers }) {
+  partNumbers = partNumbers || extractPartNumbers(`${ocrText}\n${notes}`);
   const brand = inferBrand({ ocrText, notes, mpn: partNumbers.mpn });
   const condition = determineCondition({
     aiCondition: "",
@@ -338,7 +370,7 @@ async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token
 
   try {
     const comps = await searchEbayComps(env, token, searchQuery, draftForSearch);
-    firstEbayResult = comps[0] || null;
+    firstEbayResult = comps.find((comp) => canUseEbayCompTitle(comp, partNumbers)) || null;
   } catch {
     firstEbayResult = null;
   }
@@ -366,6 +398,167 @@ async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token
     searchQuery,
     ebayTitleFallback: firstEbayResult?.title || ""
   };
+}
+
+function buildWeakOcrReviewDraft({
+  draftId,
+  now,
+  notes,
+  userCondition,
+  ocrText,
+  quantity,
+  userPriceMode,
+  cost,
+  desiredMarginPercent,
+  imageFiles,
+  imageHostResult,
+  partNumbers,
+  debug,
+  env
+}) {
+  const conditionDecision = determineCondition({
+    aiCondition: "",
+    userCondition,
+    ocrText,
+    notes,
+    title: ""
+  });
+  const priceMode = parseUserPriceMode(userPriceMode) || "market";
+  const pricing = buildReviewRequiredPricing(priceMode);
+  const identification = {
+    title: "Review Needed - Unknown Industrial Part",
+    brand: "",
+    model: "",
+    mpn: "",
+    condition: conditionDecision.condition,
+    categoryHint: "",
+    itemSpecifics: [],
+    descriptionBullets: ["OCR did not provide a strong MPN or model. Manual review is required."],
+    confidence: 0,
+    extractedPartNumbers: partNumbers.candidates,
+    searchQuery: "",
+    ebayTitleFallback: ""
+  };
+  const draft = {
+    id: draftId,
+    status: "needs_ocr_or_manual_review",
+    publishEnabled: false,
+    createdAt: now,
+    updatedAt: now,
+    title: identification.title,
+    brand: "",
+    model: "",
+    mpn: "",
+    condition: conditionDecision.condition,
+    conditionSource: conditionDecision.source,
+    conditionSignals: conditionDecision.signals,
+    categoryHint: "",
+    categoryId: null,
+    categoryName: "",
+    categorySelectionSource: "not_checked_weak_ocr",
+    ocrText,
+    ocrTextPreview: buildOcrTextPreview(ocrText),
+    extractedPartNumbers: partNumbers.candidates,
+    itemSpecifics: [],
+    descriptionBullets: identification.descriptionBullets,
+    imageUrls: imageHostResult.imageUrls,
+    hostedImages: imageHostResult.hostedImages,
+    imageHostWarnings: imageHostResult.imageHostWarnings,
+    input: {
+      notes,
+      requestedCondition: userCondition,
+      ocrText,
+      quantity,
+      priceMode: userPriceMode,
+      cost,
+      desiredMarginPercent,
+      imageCount: imageFiles.length,
+      hostedImageCount: imageHostResult.imageUrls.length
+    },
+    priceMode,
+    priceModeSource: parseUserPriceMode(userPriceMode) ? "user_override" : "weak_ocr_fallback",
+    priceModeSignals: ["No strong MPN/model was extracted from OCR; pricing was not attempted."],
+    brandStrategy: getBrandStrategy(""),
+    pricingInputs: {
+      priceMode,
+      cost,
+      desiredMarginPercent,
+      ocrText
+    },
+    price: null,
+    suggestedPrice: null,
+    priceConfidence: 0,
+    pricing,
+    identification,
+    debug,
+    ebaySearch: {
+      marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
+      query: "",
+      queries: [],
+      activeFixedPriceComps: [],
+      compCount: 0
+    }
+  };
+
+  return {
+    ...draft,
+    autoPublishEligibility: evaluateAutoPublishEligibility(draft)
+  };
+}
+
+function buildReviewRequiredPricing(priceMode) {
+  return {
+    mode: parsePriceMode(priceMode),
+    suggestedPrice: null,
+    lowPrice: null,
+    medianPrice: null,
+    highPrice: null,
+    activeMedian: null,
+    soldMedian: null,
+    priceConfidence: 0,
+    pricingReason: "No strong MPN/model was extracted from OCR.",
+    pricingWarnings: ["OCR/manual review required before comp pricing."],
+    compCount: 0,
+    exactCompCount: 0,
+    activeCompCount: 0,
+    soldCompCount: 0,
+    scarcityAdjustment: 0,
+    brandStrategy: getBrandStrategy(""),
+    conditionMultiplier: getConditionMultiplier("New Open Box"),
+    minimumMarginPrice: null,
+    acceptedComps: [],
+    rejectedComps: []
+  };
+}
+
+function canUseEbayCompTitle(comp, partNumbers) {
+  const matchScore = Number(comp?.matchScore);
+  const normalizedScore = Number.isFinite(matchScore) && matchScore > 1
+    ? matchScore / 100
+    : matchScore;
+  const exactMpn = stringValue(partNumbers?.mpn);
+
+  return normalizedScore >= 0.7
+    || (hasStrongMpn(exactMpn) && includesIdentifier(comp?.title || "", exactMpn));
+}
+
+function hasStrongExtractedIdentifier(partNumbers) {
+  return hasStrongMpn(partNumbers?.mpn)
+    || hasStrongMpn(partNumbers?.model)
+    || (Array.isArray(partNumbers?.candidates) && partNumbers.candidates.some(hasStrongMpn));
+}
+
+function buildDraftDebug({ ocrText, extractedPartNumbers, searchQueryUsed, imageCount }) {
+  return {
+    receivedOcrText: ocrText,
+    extractedPartNumbers: Array.isArray(extractedPartNumbers) ? extractedPartNumbers : [],
+    searchQueryUsed,
+    imageCount
+  };
+}
+
+function buildOcrTextPreview(ocrText) {
+  return truncateText(stringValue(ocrText).replace(/\s+/g, " "), 500);
 }
 
 function buildInitialSearchQuery({ partNumbers, ocrText }) {
@@ -662,6 +855,9 @@ async function hostUploadedImages({ imageFiles, draftId, env }) {
 }
 
 async function getEbayToken(env) {
+  requireSecret(env, "EBAY_CLIENT_ID");
+  requireSecret(env, "EBAY_CLIENT_SECRET");
+
   const credentials = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
   const body = new URLSearchParams({
     grant_type: "client_credentials",
