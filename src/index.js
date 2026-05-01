@@ -714,14 +714,25 @@ async function publishDraft(request, env) {
     return jsonResponse({ error: "draft_not_found" }, 404);
   }
 
-  if (!draft.ebayOffer?.offerId) {
+  let publishableDraft = draft;
+  if (!publishableDraft.ebayOffer?.offerId) {
+    publishableDraft = await createEbayOfferDraftOnly(publishableDraft, env, {
+      allowLowPricingConfidence: true
+    });
+    await saveDraftToKv(env, publishableDraft);
+  }
+
+  if (!publishableDraft.ebayOffer?.offerId) {
     return jsonResponse({
       error: "offer_required",
-      message: "Approve the draft before publishing so an eBay offer exists."
+      message: "An eBay offer could not be created automatically before publishing.",
+      status: publishableDraft.status,
+      ebayOfferWarnings: publishableDraft.ebayOfferWarnings || [],
+      draft: publishableDraft
     }, 409);
   }
 
-  const publishedDraft = await publishExistingEbayOffer(draft, env);
+  const publishedDraft = await publishExistingEbayOffer(publishableDraft, env);
   await saveDraftToKv(env, publishedDraft);
   return jsonResponse(publishedDraft);
 }
@@ -974,8 +985,8 @@ async function getEbayUserToken(env) {
   return payload.access_token;
 }
 
-async function createEbayOfferDraftOnly(draft, env) {
-  if (draft.pricing?.priceConfidence < 0.45) {
+async function createEbayOfferDraftOnly(draft, env, options = {}) {
+  if (!options.allowLowPricingConfidence && draft.pricing?.priceConfidence < 0.45) {
     return {
       ...draft,
       status: "pricing_review_required",
