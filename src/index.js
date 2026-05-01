@@ -138,7 +138,7 @@ async function createDraft(request, env) {
     ? await hostUploadedImages({ imageFiles, draftId, env })
     : { imageUrls: [], hostedImages: [], imageHostWarnings: [] };
   const ebayToken = await getEbayToken(env);
-  const identification = await identifyItemFromOcrAndEbay({
+  let identification = await identifyItemFromOcrAndEbay({
     ocrText,
     notes,
     userCondition,
