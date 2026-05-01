@@ -31,6 +31,7 @@ const KNOWN_BRANDS = [
   "Danfoss",
   "Lenze",
   "Phoenix Contact",
+  "Schneider Electric",
   "Marel",
   "Ishida",
   "Secomea"
@@ -143,6 +144,9 @@ async function createDraft(request, env) {
   const debug = buildDraftDebug({
     ocrText,
     extractedPartNumbers: partNumbers.candidates,
+    selectedMpn: partNumbers.mpn,
+    detectedBrand: inferBrand({ ocrText, notes, mpn: partNumbers.mpn }),
+    itemType: detectItemType(ocrText),
     searchQueryUsed: hasStrongExtractedIdentifier(partNumbers)
       ? buildInitialSearchQuery({ partNumbers, ocrText })
       : "",
@@ -348,6 +352,9 @@ async function approveDraft(request, env) {
 async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token, env, partNumbers }) {
   partNumbers = partNumbers || extractPartNumbers(`${ocrText}\n${notes}`);
   const brand = inferBrand({ ocrText, notes, mpn: partNumbers.mpn });
+  const productFamily = detectProductFamily(ocrText);
+  const itemType = detectItemType(ocrText);
+  const rating = detectCurrentRating(ocrText);
   const condition = determineCondition({
     aiCondition: "",
     userCondition,
@@ -361,6 +368,9 @@ async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token
     brand,
     model: partNumbers.model,
     mpn: partNumbers.mpn,
+    productFamily,
+    itemType,
+    rating,
     condition,
     ocrText,
     extractedPartNumbers: partNumbers.candidates,
@@ -379,6 +389,9 @@ async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token
     brand,
     mpn: partNumbers.mpn,
     model: partNumbers.model,
+    productFamily,
+    itemType,
+    rating,
     categoryName: "Industrial Part",
     condition,
     fallbackTitle: firstEbayResult?.title
@@ -389,9 +402,12 @@ async function identifyItemFromOcrAndEbay({ ocrText, notes, userCondition, token
     brand,
     model: partNumbers.model,
     mpn: partNumbers.mpn,
+    productFamily,
+    itemType,
+    rating,
     condition,
     categoryHint: "Industrial automation part",
-    itemSpecifics: buildHeuristicItemSpecifics({ brand, mpn: partNumbers.mpn, model: partNumbers.model }),
+    itemSpecifics: buildHeuristicItemSpecifics({ brand, mpn: partNumbers.mpn, model: partNumbers.model, productFamily, itemType }),
     descriptionBullets: buildHeuristicDescriptionBullets({ brand, mpn: partNumbers.mpn, model: partNumbers.model, condition }),
     confidence: partNumbers.mpn || firstEbayResult ? 0.65 : 0.15,
     extractedPartNumbers: partNumbers.candidates,
@@ -548,10 +564,13 @@ function hasStrongExtractedIdentifier(partNumbers) {
     || (Array.isArray(partNumbers?.candidates) && partNumbers.candidates.some(hasStrongMpn));
 }
 
-function buildDraftDebug({ ocrText, extractedPartNumbers, searchQueryUsed, imageCount }) {
+function buildDraftDebug({ ocrText, extractedPartNumbers, selectedMpn, detectedBrand, itemType, searchQueryUsed, imageCount }) {
   return {
     receivedOcrText: ocrText,
     extractedPartNumbers: Array.isArray(extractedPartNumbers) ? extractedPartNumbers : [],
+    selectedMpn,
+    detectedBrand,
+    itemType,
     searchQueryUsed,
     imageCount
   };
@@ -581,6 +600,10 @@ function cleanOcrSearchText(ocrText) {
 
 function inferBrand({ ocrText, notes, mpn }) {
   const text = joinSignalText([ocrText, notes]);
+  if (text.includes("schneider")) {
+    return "Schneider Electric";
+  }
+
   const knownBrand = KNOWN_BRANDS.find((brand) => text.includes(brand.toLowerCase()));
   if (knownBrand) {
     return knownBrand;
@@ -594,14 +617,53 @@ function inferBrand({ ocrText, notes, mpn }) {
   return "";
 }
 
-function buildTitle({ brand, mpn, model, categoryName, condition, fallbackTitle }) {
+function detectProductFamily(ocrText) {
+  const text = joinSignalText([ocrText]);
+  if (text.includes("powerpact")) {
+    return "PowerPact";
+  }
+
+  return "";
+}
+
+function detectItemType(ocrText) {
+  const text = joinSignalText([ocrText]);
+  if (text.includes("circuit breaker") || text.includes("powerpact")) {
+    return "Circuit Breaker";
+  }
+
+  return "";
+}
+
+function detectCurrentRating(ocrText) {
+  const text = stringValue(ocrText);
+  const ampMatch = text.match(/\b(\d{2,4})\s*(?:a|amp|amps)\b/i);
+  if (ampMatch) {
+    return `${ampMatch[1]}A`;
+  }
+
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  for (const line of lines) {
+    const hjMatch = line.match(/\bHJ\s+(\d{2,4})\b/i);
+    if (hjMatch) {
+      return `${hjMatch[1]}A`;
+    }
+  }
+
+  return "";
+}
+
+function buildTitle({ brand, mpn, model, productFamily, itemType, rating, categoryName, condition, fallbackTitle }) {
   const hasIdentifier = Boolean(firstNonEmpty([brand, mpn, model]));
   const generated = dedupeWords([
     brand,
     mpn,
+    productFamily,
+    itemType,
+    rating,
     !mpn || model !== mpn ? model : "",
-    categoryName,
-    condition
+    productFamily || itemType ? "" : categoryName,
+    productFamily || itemType ? "" : condition
   ], 14);
 
   return truncateText(firstNonEmpty([
@@ -612,11 +674,13 @@ function buildTitle({ brand, mpn, model, categoryName, condition, fallbackTitle 
   ]), 80);
 }
 
-function buildHeuristicItemSpecifics({ brand, mpn, model }) {
+function buildHeuristicItemSpecifics({ brand, mpn, model, productFamily, itemType }) {
   return normalizeItemSpecifics({
     Brand: brand,
     MPN: mpn,
-    Model: model
+    Model: model,
+    "Product Family": productFamily,
+    Type: itemType
   });
 }
 
@@ -2081,6 +2145,10 @@ function extractPartNumberCandidates(text) {
   const labeledValuePattern = /\b(?:mpn|m\.?p\.?n\.?|model(?:\s*(?:no\.?|number|#))?|part(?:\s*(?:no\.?|number|#))?|p\/n|pn|catalog(?:\s*(?:no\.?|number|#))?|cat(?:\.|\s)*(?:no\.?|number|#)?|mfr(?:\s+part)?(?:\s*(?:no\.?|number|#))?|manufacturer\s+part(?:\s*(?:no\.?|number|#))?)\s*[:#-]?\s*([a-z0-9][a-z0-9._/\-\s]{2,})/gi;
   const siemensPattern = /\b\d[a-z]{2}\d\s+\d{3}-[a-z0-9]{4,}-[a-z0-9]{3,}\b/gi;
   const requestedHyphenatedPattern = /\b[A-Z0-9]{2,}-[A-Z0-9\-]+\b/gi;
+  const industrialCompactPattern = /\b[A-Z]{2,}\d{3,}\b/gi;
+  const industrialAlphaNumericPattern = /\b[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b/gi;
+  const longIndustrialCompactPattern = /\b[A-Z]{2,}\d{5,}\b/gi;
+  const industrialSuffixPattern = /\b[A-Z]{2,}\d{3,}[A-Z0-9]*\b/gi;
   const requestedCompactPattern = /\b[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b/gi;
   const hyphenatedPattern = /\b[a-z0-9]{2,}(?:[-/][a-z0-9]{2,})+\b/gi;
   const compactPattern = /\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{5,}\b/gi;
@@ -2091,7 +2159,7 @@ function extractPartNumberCandidates(text) {
 
     if (hasPartLabel) {
       for (const match of line.matchAll(labeledValuePattern)) {
-        candidates.push(cleanPartNumber(match[1]));
+        candidates.push(...extractLabeledPartNumberCandidates(match[1]));
       }
     }
 
@@ -2099,7 +2167,17 @@ function extractPartNumberCandidates(text) {
       continue;
     }
 
-    for (const pattern of [siemensPattern, requestedHyphenatedPattern, requestedCompactPattern, hyphenatedPattern, compactPattern]) {
+    for (const pattern of [
+      siemensPattern,
+      requestedHyphenatedPattern,
+      industrialCompactPattern,
+      industrialAlphaNumericPattern,
+      longIndustrialCompactPattern,
+      industrialSuffixPattern,
+      requestedCompactPattern,
+      hyphenatedPattern,
+      compactPattern
+    ]) {
       for (const match of line.matchAll(pattern)) {
         candidates.push(cleanPartNumber(match[0]));
       }
@@ -2107,7 +2185,7 @@ function extractPartNumberCandidates(text) {
   }
 
   return uniqueNonEmpty(candidates)
-    .filter((candidate) => !isLikelyMeasurement(candidate))
+    .filter((candidate) => !isLikelyPartNumberNoise(candidate))
     .slice(0, 12);
 }
 
@@ -2120,8 +2198,69 @@ function cleanPartNumber(value) {
     .replace(/[^a-z0-9._/\-\s]/gi, "");
 }
 
+function extractLabeledPartNumberCandidates(value) {
+  const cleaned = cleanPartNumber(value)
+    .replace(/\b(?:ser(?:ial)?|series|rev(?:ision)?|date|made|input|output|hz|volts?|amps?)\b.*$/i, "")
+    .trim();
+  const tokenPatterns = [
+    /\b\d[a-z]{2}\d\s+\d{3}-[a-z0-9]{4,}-[a-z0-9]{3,}\b/gi,
+    /\b[A-Z0-9]{2,}-[A-Z0-9\-]+\b/gi,
+    /\b[A-Z]{2,}\d{3,}\b/gi,
+    /\b[A-Z]{2,}\d{2,}[A-Z0-9\-]*\b/gi,
+    /\b[A-Z]{2,}\d{5,}\b/gi,
+    /\b[A-Z]{2,}\d{3,}[A-Z0-9]*\b/gi,
+    /\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]{5,}\b/gi
+  ];
+  const tokenCandidates = [];
+
+  for (const pattern of tokenPatterns) {
+    for (const match of cleaned.matchAll(pattern)) {
+      tokenCandidates.push(cleanPartNumber(match[0]));
+    }
+  }
+
+  return uniqueNonEmpty(tokenCandidates.length > 0 ? tokenCandidates : [cleaned])
+    .filter((candidate) => !isLikelyPartNumberNoise(candidate));
+}
+
 function isLikelyMeasurement(value) {
   return /^\d+(?:\.\d+)?(?:v|vac|vdc|a|amp|amps|hz|w|kw|hp|ma|dc|ac)$/i.test(value);
+}
+
+function isLikelyPartNumberNoise(value) {
+  const candidate = cleanPartNumber(value);
+  const normalized = candidate.toUpperCase().replace(/\s+/g, " ");
+  const compact = normalized.replace(/[^A-Z0-9]/g, "");
+
+  if (!candidate || isLikelyMeasurement(candidate)) {
+    return true;
+  }
+  if (/^\d+$/.test(compact)) {
+    return true;
+  }
+  if (/^\d+(?:A|V|VAC|VDC|HZ|W|KW|HP)$/.test(compact)) {
+    return true;
+  }
+  if (/^\d+\/\d+(?:HZ|V|VAC|VDC)?$/.test(normalized.replace(/\s+/g, ""))) {
+    return true;
+  }
+  if (/^\d+(?:\/\d+)?~$/.test(normalized.replace(/\s+/g, ""))) {
+    return true;
+  }
+  if (/^\d+\s*[13]Φ$/.test(normalized) || /^[13]Φ$/.test(normalized)) {
+    return true;
+  }
+  if (/^(IEC|CSA|NEMA|NOM)$/.test(normalized)) {
+    return true;
+  }
+  if (/^IEC\s*\d/.test(normalized) || /^IEC\d/.test(compact)) {
+    return true;
+  }
+  if (/^(CSA|NEMA|NOM)[A-Z0-9-]*$/.test(compact)) {
+    return true;
+  }
+
+  return false;
 }
 
 function getDraftPartNumbers(draft) {
