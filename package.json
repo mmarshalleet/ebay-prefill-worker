@@ -1,5 +1,5 @@
 {
-  "name": "ebay-prefill-worker",
+  "name": "ebay-photo-listing-draft-worker",
   "version": "1.0.0",
   "private": true,
   "type": "module",
