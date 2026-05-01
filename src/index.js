@@ -15,6 +15,10 @@ const EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/
 const EBAY_TAXONOMY_TREE_URL = "https://api.ebay.com/commerce/taxonomy/v1/category_tree/0";
 const EBAY_INVENTORY_URL = "https://api.ebay.com/sell/inventory/v1";
 const EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope";
+const EBAY_SELL_SCOPE = [
+  "https://api.ebay.com/oauth/api_scope/sell.inventory",
+  "https://api.ebay.com/oauth/api_scope/sell.account"
+].join(" ");
 
 const KNOWN_BRANDS = [
   "Allen-Bradley",
@@ -261,7 +265,7 @@ async function approveDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
   requireSecret(env, "EBAY_CLIENT_ID");
   requireSecret(env, "EBAY_CLIENT_SECRET");
-  requireSecret(env, "EBAY_TOKEN");
+  requireSecret(env, "EBAY_REFRESH_TOKEN");
 
   let body;
   try {
@@ -434,7 +438,9 @@ function buildHeuristicDescriptionBullets({ brand, mpn, model, condition }) {
 
 async function publishDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
-  requireSecret(env, "EBAY_TOKEN");
+  requireSecret(env, "EBAY_CLIENT_ID");
+  requireSecret(env, "EBAY_CLIENT_SECRET");
+  requireSecret(env, "EBAY_REFRESH_TOKEN");
 
   const body = await parseJsonRequest(request, "POST /publish requires JSON.");
   if (body.errorResponse) {
@@ -465,7 +471,9 @@ async function publishDraft(request, env) {
 
 async function instantListDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
-  requireSecret(env, "EBAY_TOKEN");
+  requireSecret(env, "EBAY_CLIENT_ID");
+  requireSecret(env, "EBAY_CLIENT_SECRET");
+  requireSecret(env, "EBAY_REFRESH_TOKEN");
 
   const body = await parseJsonRequest(request, "POST /instant-list requires JSON.");
   if (body.errorResponse) {
@@ -677,6 +685,35 @@ async function getEbayToken(env) {
   return payload.access_token;
 }
 
+async function getEbayUserToken(env) {
+  requireSecret(env, "EBAY_CLIENT_ID");
+  requireSecret(env, "EBAY_CLIENT_SECRET");
+  requireSecret(env, "EBAY_REFRESH_TOKEN");
+
+  const credentials = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: env.EBAY_REFRESH_TOKEN,
+    scope: EBAY_SELL_SCOPE
+  });
+
+  const response = await fetch(EBAY_OAUTH_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${credentials}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const payload = await parseJsonResponse(response, "eBay user OAuth");
+  if (!payload.access_token) {
+    throw new Error("eBay user OAuth did not return an access token.");
+  }
+
+  return payload.access_token;
+}
+
 async function createEbayOfferDraftOnly(draft, env) {
   if (draft.pricing?.priceConfidence < 0.45) {
     return {
@@ -814,9 +851,10 @@ async function publishExistingEbayOffer(draft, env) {
 }
 
 async function putEbayInventoryItem({ sku, payload, env }) {
+  const token = await getEbayUserToken(env);
   const response = await fetch(`${EBAY_INVENTORY_URL}/inventory_item/${encodeURIComponent(sku)}`, {
     method: "PUT",
-    headers: getEbaySellHeaders(env),
+    headers: getEbaySellHeaders(token, env),
     body: JSON.stringify(payload)
   });
 
@@ -828,9 +866,10 @@ async function putEbayInventoryItem({ sku, payload, env }) {
 }
 
 async function createEbayOffer({ payload, env }) {
+  const token = await getEbayUserToken(env);
   const response = await fetch(`${EBAY_INVENTORY_URL}/offer`, {
     method: "POST",
-    headers: getEbaySellHeaders(env),
+    headers: getEbaySellHeaders(token, env),
     body: JSON.stringify(payload)
   });
 
@@ -838,9 +877,10 @@ async function createEbayOffer({ payload, env }) {
 }
 
 async function publishEbayOffer({ offerId, env }) {
+  const token = await getEbayUserToken(env);
   const response = await fetch(`${EBAY_INVENTORY_URL}/offer/${encodeURIComponent(offerId)}/publish`, {
     method: "POST",
-    headers: getEbaySellHeaders(env)
+    headers: getEbaySellHeaders(token, env)
   });
 
   return await parseJsonResponse(response, "eBay Inventory publishOffer");
@@ -2455,9 +2495,9 @@ function getEbayHeaders(token, env) {
   };
 }
 
-function getEbaySellHeaders(env) {
+function getEbaySellHeaders(token, env) {
   return {
-    "Authorization": `Bearer ${env.EBAY_TOKEN}`,
+    "Authorization": `Bearer ${token}`,
     "Content-Type": "application/json",
     "Content-Language": env.EBAY_CONTENT_LANGUAGE || "en-US",
     "X-EBAY-C-MARKETPLACE-ID": env.EBAY_MARKETPLACE_ID || "EBAY_US"

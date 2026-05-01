@@ -222,9 +222,10 @@ POST https://api.ebay.com/sell/inventory/v1/offer/{offerId}/publish
 
 The `publishOffer` response is saved as `draft.ebayListing`, including the returned `listingId` when eBay provides one. `/instant-list` may call both flows, but only after `autoPublishEligibility.eligible` is true.
 
-Required for `/approve`:
+Required for `/approve`, `/publish`, and `/instant-list` seller API calls:
 
-- `EBAY_TOKEN`: a seller/user OAuth access token with Sell Inventory scope. This is different from the app client-credentials token used for Browse and Taxonomy.
+- `EBAY_REFRESH_TOKEN`: a seller/user OAuth refresh token. The Worker exchanges it for a short-lived user access token with Sell Inventory and Sell Account scopes before calling eBay seller APIs.
+- `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET`: used for both app client-credentials Browse/Taxonomy calls and refresh-token seller API access.
 
 Recommended for offers that are closer to publish-ready:
 
@@ -234,7 +235,7 @@ Recommended for offers that are closer to publish-ready:
 - `EBAY_RETURN_POLICY_ID`
 - `EBAY_CONTENT_LANGUAGE`, defaults to `en-US`
 
-The Shortcut uploads raw photos to the Worker for AI identification. `POST /draft` stores those photos in the R2 bucket bound as `IMAGES`, saves the public R2 URLs as `draft.imageUrls`, and sends those URLs to the eBay Inventory item during `/approve`.
+The Shortcut can upload raw photos to the Worker for listing images. `POST /draft` stores those photos in the R2 bucket bound as `IMAGES`, saves the public R2 URLs as `draft.imageUrls`, and sends those URLs to the eBay Inventory item during `/approve`.
 
 ## Hosted Listing Photos
 
@@ -357,7 +358,7 @@ Add secrets:
 ```bash
 npx wrangler secret put EBAY_CLIENT_ID
 npx wrangler secret put EBAY_CLIENT_SECRET
-npx wrangler secret put EBAY_TOKEN
+npx wrangler secret put EBAY_REFRESH_TOKEN
 ```
 
 Optional sold comp support:
