@@ -68,7 +68,7 @@ export default {
   }
 };
 
-async function createDraft(request, env) {
+ async function createDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
 
   const contentType = request.headers.get("Content-Type") || "";
@@ -76,26 +76,56 @@ async function createDraft(request, env) {
 
   if (contentType.includes("multipart/form-data")) {
     const form = await request.formData();
+
     input = {
-      title: form.get("title") || "",
+      title: form.get("title") || form.get("itemTitle") || "",
       notes: form.get("notes") || "",
-      ocrText: form.get("ocrText") || "",
+      ocrText: form.get("ocrText") || form.get("ocr") || form.get("text") || "",
       condition: form.get("condition") || "New Open Box",
       quantity: Number(form.get("quantity") || 1),
-      price: Number(form.get("price") || 0),
+      price: Number(form.get("price") || form.get("suggestedPrice") || 0),
       categoryId: form.get("categoryId") || "",
       brand: form.get("brand") || "",
-      mpn: form.get("mpn") || "",
-      imageUrls: parseJsonArray(form.get("imageUrls"))
+      mpn: form.get("mpn") || form.get("partNumber") || "",
+      imageUrls: parseJsonArray(form.get("imageUrls")),
+      itemSpecifics: parseJsonObject(form.get("itemSpecifics"))
     };
   } else {
-    input = await request.json();
+    const body = await request.json();
+
+    input = {
+      ...body,
+      title: body.title || body.itemTitle || body.name || "",
+      notes: body.notes || body.description || "",
+      ocrText: body.ocrText || body.ocr || body.text || "",
+      condition: body.condition || "New Open Box",
+      quantity: Number(body.quantity || 1),
+      price: Number(body.price || body.suggestedPrice || 0),
+      categoryId: body.categoryId || "",
+      brand: body.brand || "",
+      mpn: body.mpn || body.partNumber || "",
+      imageUrls: body.imageUrls || body.images || [],
+      itemSpecifics: body.itemSpecifics || body.aspects || {}
+    };
   }
 
-  const text = `${input.title || ""}\n${input.notes || ""}\n${input.ocrText || ""}`;
-  const extracted = extractPartNumbers(text);
-  const brand = input.brand || inferBrand(text);
+  const fullText = [
+    input.title,
+    input.notes,
+    input.ocrText,
+    input.brand,
+    input.mpn
+  ].filter(Boolean).join("\n");
+
+  const extracted = extractPartNumbers(fullText);
+  const brand = input.brand || inferBrand(fullText);
   const mpn = input.mpn || extracted[0] || "";
+
+  const itemSpecifics = normalizeItemSpecifics({
+    Brand: brand,
+    MPN: mpn,
+    ...(input.itemSpecifics || {})
+  });
 
   const draft = {
     id: crypto.randomUUID(),
@@ -103,27 +133,35 @@ async function createDraft(request, env) {
     publishEnabled: false,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    title: cleanTitle(input.title || buildTitle({ brand, mpn, text })),
+
+    title: cleanTitle(input.title || buildTitle({ brand, mpn, text: fullText })),
     brand,
     mpn,
     model: mpn,
-    condition: input.condition || "New Open Box",
+    condition: input.condition,
     quantity: positiveInt(input.quantity, 1),
-    price: Number(input.price || 0) || null,
-    suggestedPrice: null,
+    price: input.price || null,
+    suggestedPrice: input.price || null,
     categoryId: input.categoryId || "",
-    itemSpecifics: normalizeItemSpecifics(input.itemSpecifics || {
-      Brand: brand,
-      MPN: mpn
-    }),
+
+    notes: input.notes,
+    ocrText: input.ocrText,
+    ocrTextPreview: String(input.ocrText || "").slice(0, 500),
+    extractedPartNumbers: extracted,
+
+    itemSpecifics,
+    ebayAspects: convertAspects(itemSpecifics),
+
     descriptionBullets: [
       brand ? `Brand: ${brand}` : "",
       mpn ? `MPN: ${mpn}` : "",
-      `Condition: ${input.condition || "New Open Box"}`
+      `Condition: ${input.condition}`,
+      input.notes ? `Notes: ${input.notes}` : ""
     ].filter(Boolean),
+
     imageUrls: Array.isArray(input.imageUrls) ? input.imageUrls.filter(Boolean) : [],
-    input,
-    extractedPartNumbers: extracted
+
+    input
   };
 
   await saveDraft(env, draft);
