@@ -325,9 +325,33 @@ async function instantList(request, env) {
   return json(draft);
 }
 
-async function createEbayOfferDraftOnly(draft, env) {
-  const token = await getEbayToken(env);
-  const sku = draft.sku || draft.id;
+async function getEbayToken(env) {
+  if (env.EBAY_USER_TOKEN) return env.EBAY_USER_TOKEN;
+
+  const basic = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "refresh_token");
+  body.set("refresh_token", env.EBAY_REFRESH_TOKEN);
+  body.set("scope", [
+    "https://api.ebay.com/oauth/api_scope/sell.inventory",
+    "https://api.ebay.com/oauth/api_scope/sell.account"
+  ].join(" "));
+
+  const res = await fetch(EBAY_OAUTH_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const data = await safeJson(res);
+  if (!res.ok) throw apiError("eBay OAuth failed", res.status, data);
+
+  return data.access_token;
+}
 
   const price = Number(draft.price || draft.suggestedPrice || 0);
   if (!price || price <= 0) {
