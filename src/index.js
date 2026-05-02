@@ -745,7 +745,35 @@ function json(data, status = 200) {
 function requireBinding(env, name) {
   if (!env[name]) throw new Error(`Missing Cloudflare binding: ${name}`);
 }
+function estimateFallbackPrice({ brand, mpn, rating, type, text }) {
+  const t = String(text || "").toLowerCase();
+  const r = Number(String(rating || "").replace(/\D/g, ""));
 
+  // Known strong industrial breaker example:
+  // Schneider / Square D PowerPact HJA36150 150A
+  if (
+    /hja36150/i.test(mpn || "") ||
+    (brand === "Schneider Electric" && t.includes("powerpact") && r === 150)
+  ) {
+    return 450;
+  }
+
+  if (type === "Circuit Breaker") {
+    if (r >= 400) return 750;
+    if (r >= 250) return 550;
+    if (r >= 150) return 425;
+    if (r >= 100) return 300;
+    return 175;
+  }
+
+  if (type === "VFD Drive") return 350;
+  if (type === "HMI") return 500;
+  if (type === "PLC Module") return 300;
+  if (type === "Sensor") return 75;
+  if (type === "Relay") return 60;
+
+  return 99;
+}
 function requireEbaySecrets(env) {
   for (const key of ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "EBAY_REFRESH_TOKEN"]) {
     if (!env[key]) throw new Error(`Missing secret: ${key}`);
