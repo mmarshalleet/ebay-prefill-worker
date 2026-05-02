@@ -26,35 +26,15 @@ export default {
         return json({
           ok: true,
           service: "ebay-prefill-worker",
-          endpoints: [
-            "POST /draft",
-            "GET /draft?id=...",
-            "POST /approve",
-            "POST /publish",
-            "POST /instant-list"
-          ]
+          endpoints: ["POST /draft", "GET /draft?id=...", "POST /approve", "POST /publish", "POST /instant-list"]
         });
       }
 
-      if (url.pathname === "/draft" && request.method === "POST") {
-        return await createDraft(request, env);
-      }
-
-      if (url.pathname === "/draft" && request.method === "GET") {
-        return await getDraft(url, env);
-      }
-
-      if (url.pathname === "/approve" && request.method === "POST") {
-        return await approveDraft(request, env);
-      }
-
-      if (url.pathname === "/publish" && request.method === "POST") {
-        return await publishDraft(request, env);
-      }
-
-      if (url.pathname === "/instant-list" && request.method === "POST") {
-        return await instantList(request, env);
-      }
+      if (url.pathname === "/draft" && request.method === "POST") return await createDraft(request, env);
+      if (url.pathname === "/draft" && request.method === "GET") return await getDraft(url, env);
+      if (url.pathname === "/approve" && request.method === "POST") return await approveDraft(request, env);
+      if (url.pathname === "/publish" && request.method === "POST") return await publishDraft(request, env);
+      if (url.pathname === "/instant-list" && request.method === "POST") return await instantList(request, env);
 
       return json({ ok: false, error: "not_found" }, 404);
     } catch (err) {
@@ -78,9 +58,7 @@ async function createDraft(request, env) {
     const form = await request.formData();
 
     for (const [key, value] of form.entries()) {
-      receivedFields[key] = value instanceof File
-        ? `[file: ${value.name || "unnamed"}]`
-        : String(value).slice(0, 1000);
+      receivedFields[key] = value instanceof File ? `[file: ${value.name || "unnamed"}]` : String(value).slice(0, 1000);
     }
 
     const allText = [
@@ -105,6 +83,7 @@ async function createDraft(request, env) {
       quantity: Number(form.get("quantity") || 1),
       price: Number(form.get("price") || form.get("suggestedPrice") || 0),
       categoryId: form.get("categoryId") || "",
+      categoryName: form.get("categoryName") || "",
       brand: form.get("brand") || "",
       mpn: form.get("mpn") || form.get("partNumber") || form.get("model") || "",
       imageUrls: parseJsonArray(form.get("imageUrls")),
@@ -137,6 +116,7 @@ async function createDraft(request, env) {
       quantity: Number(body.quantity || 1),
       price: Number(body.price || body.suggestedPrice || 0),
       categoryId: body.categoryId || "",
+      categoryName: body.categoryName || "",
       brand: body.brand || "",
       mpn: body.mpn || body.partNumber || body.model || "",
       imageUrls: body.imageUrls || body.images || [],
@@ -144,19 +124,20 @@ async function createDraft(request, env) {
     };
   }
 
-  const fullText = [
-    input.title,
-    input.notes,
-    input.ocrText,
-    input.brand,
-    input.mpn
-  ].filter(Boolean).join("\n");
+  const fullText = [input.title, input.notes, input.ocrText, input.brand, input.mpn].filter(Boolean).join("\n");
 
   const extracted = extractPartNumbers(fullText);
   const brand = input.brand || inferBrand(fullText);
-  const mpn = input.mpn || pickBestMpn(extracted, fullText);
+  const mpn = input.mpn || pickBestMpn(extracted);
   const rating = detectAmpRating(fullText);
   const type = detectType(fullText);
+
+  const categoryGuess = guessCategory({ type, text: fullText });
+  const categoryId = input.categoryId || categoryGuess.categoryId;
+  const categoryName = input.categoryName || categoryGuess.categoryName;
+
+  const price = input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText });
+  const pricingConfidence = input.price ? "manual" : "fallback";
 
   const title = cleanTitle(
     input.title ||
@@ -173,10 +154,25 @@ async function createDraft(request, env) {
     ...(input.itemSpecifics || {})
   });
 
+  const instantEligible = Boolean(
+    title &&
+    conditionToLabel(input.condition) &&
+    price &&
+    categoryId &&
+    mpn &&
+    brand
+  );
+
   const draft = {
     id: crypto.randomUUID(),
     status: mpn || brand ? "draft" : "needs_manual_review",
     publishEnabled: false,
+    instantEligible,
+    autoPublishEligibility: {
+      eligible: instantEligible,
+      reasons: instantEligible ? [] : buildEligibilityReasons({ title, brand, mpn, price, categoryId })
+    },
+
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
 
@@ -186,12 +182,17 @@ async function createDraft(request, env) {
     model: mpn,
     rating,
     type,
-    condition: input.condition,
+    condition: conditionToLabel(input.condition),
     quantity: positiveInt(input.quantity, 1),
-    price: input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText }),
-    suggestedPrice: input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText }),
-    pricingConfidence: input.price ? "manual" : "fallback",
-    categoryId: input.categoryId || "",
+
+    price,
+    suggestedPrice: price,
+    pricingConfidence,
+    pricingReason: pricingConfidence === "manual" ? "Manual price provided." : "Fallback estimate based on detected item type/rating.",
+
+    categoryId,
+    categoryName,
+    category: categoryName,
 
     notes: input.notes,
     ocrText: input.ocrText,
@@ -206,7 +207,8 @@ async function createDraft(request, env) {
       mpn ? `MPN: ${mpn}` : "",
       rating ? `Rating: ${rating}` : "",
       type ? `Type: ${type}` : "",
-      `Condition: ${input.condition}`,
+      categoryName ? `Category: ${categoryName}` : "",
+      `Condition: ${conditionToLabel(input.condition)}`,
       input.notes ? `Notes: ${input.notes}` : ""
     ].filter(Boolean),
 
@@ -220,7 +222,8 @@ async function createDraft(request, env) {
       detectedBrand: brand,
       detectedMpn: mpn,
       detectedRating: rating,
-      detectedType: type
+      detectedType: type,
+      categoryGuess
     },
 
     input
@@ -291,9 +294,7 @@ async function publishDraft(request, env) {
   let draft = await env.DRAFT_KV.get(draftId, { type: "json" });
   if (!draft) return json({ ok: false, error: "draft_not_found" }, 404);
 
-  if (!draft.ebayOffer?.offerId) {
-    draft = await createEbayOfferDraftOnly(draft, env);
-  }
+  if (!draft.ebayOffer?.offerId) draft = await createEbayOfferDraftOnly(draft, env);
 
   const published = await publishExistingEbayOffer(draft, env);
   await saveDraft(env, published);
@@ -315,9 +316,7 @@ async function instantList(request, env) {
 
   draft = applyOverrides(draft, body);
 
-  if (!draft.categoryId) {
-    draft.categoryId = await suggestCategoryId(draft, env);
-  }
+  if (!draft.categoryId) draft.categoryId = await suggestCategoryId(draft, env);
 
   draft = await createEbayOfferDraftOnly(draft, env);
   draft = await publishExistingEbayOffer(draft, env);
@@ -383,15 +382,9 @@ async function createEbayOfferDraftOnly(draft, env) {
     }
   };
 
-  if (env.EBAY_LOCATION_KEY) {
-    offerPayload.merchantLocationKey = env.EBAY_LOCATION_KEY;
-  }
+  if (env.EBAY_LOCATION_KEY) offerPayload.merchantLocationKey = env.EBAY_LOCATION_KEY;
 
-  if (
-    env.EBAY_PAYMENT_POLICY_ID &&
-    env.EBAY_RETURN_POLICY_ID &&
-    env.EBAY_FULFILLMENT_POLICY_ID
-  ) {
+  if (env.EBAY_PAYMENT_POLICY_ID && env.EBAY_RETURN_POLICY_ID && env.EBAY_FULFILLMENT_POLICY_ID) {
     offerPayload.listingPolicies = {
       paymentPolicyId: env.EBAY_PAYMENT_POLICY_ID,
       returnPolicyId: env.EBAY_RETURN_POLICY_ID,
@@ -406,6 +399,7 @@ async function createEbayOfferDraftOnly(draft, env) {
     sku,
     status: "ready_to_publish_later",
     publishEnabled: true,
+    instantEligible: true,
     ebayOffer: {
       offerId: offer.offerId,
       sku,
@@ -508,18 +502,91 @@ function applyOverrides(draft, body) {
   if (body.price) updated.price = Number(body.price);
   if (body.suggestedPrice) updated.suggestedPrice = Number(body.suggestedPrice);
   if (body.categoryId) updated.categoryId = String(body.categoryId).trim();
-  if (body.condition) updated.condition = body.condition;
+  if (body.categoryName) {
+    updated.categoryName = String(body.categoryName).trim();
+    updated.category = updated.categoryName;
+  }
+  if (body.condition) updated.condition = conditionToLabel(body.condition);
   if (body.quantity) updated.quantity = positiveInt(body.quantity, 1);
   if (body.brand) updated.brand = body.brand;
   if (body.mpn) updated.mpn = body.mpn;
   if (Array.isArray(body.imageUrls)) updated.imageUrls = body.imageUrls.filter(Boolean);
+  if (body.itemSpecifics) updated.itemSpecifics = normalizeItemSpecifics(body.itemSpecifics);
 
-  if (body.itemSpecifics) {
-    updated.itemSpecifics = normalizeItemSpecifics(body.itemSpecifics);
+  updated.instantEligible = Boolean(updated.title && updated.condition && updated.price && updated.categoryId && updated.mpn && updated.brand);
+  updated.updatedAt = new Date().toISOString();
+
+  return updated;
+}
+
+function guessCategory({ type, text }) {
+  const t = String(text || "").toLowerCase();
+
+  if (type === "Circuit Breaker" || t.includes("breaker") || t.includes("powerpact")) {
+    return {
+      categoryId: "181841",
+      categoryName: "Circuit Breakers"
+    };
   }
 
-  updated.updatedAt = new Date().toISOString();
-  return updated;
+  if (type === "VFD Drive") {
+    return {
+      categoryId: "78191",
+      categoryName: "Variable Frequency Drives"
+    };
+  }
+
+  if (type === "HMI") {
+    return {
+      categoryId: "181735",
+      categoryName: "Operator Interface Panels"
+    };
+  }
+
+  if (type === "PLC Module") {
+    return {
+      categoryId: "181730",
+      categoryName: "PLC Processors"
+    };
+  }
+
+  return {
+    categoryId: "",
+    categoryName: ""
+  };
+}
+
+function estimateFallbackPrice({ brand, mpn, rating, type, text }) {
+  const t = String(text || "").toLowerCase();
+  const r = Number(String(rating || "").replace(/\D/g, ""));
+
+  if (/hja36150/i.test(mpn || "") || (brand === "Schneider Electric" && t.includes("powerpact") && r === 150)) return 450;
+
+  if (type === "Circuit Breaker") {
+    if (r >= 400) return 750;
+    if (r >= 250) return 550;
+    if (r >= 150) return 450;
+    if (r >= 100) return 300;
+    return 175;
+  }
+
+  if (type === "VFD Drive") return 350;
+  if (type === "HMI") return 500;
+  if (type === "PLC Module") return 300;
+  if (type === "Sensor") return 75;
+  if (type === "Relay") return 60;
+
+  return 99;
+}
+
+function buildEligibilityReasons({ title, brand, mpn, price, categoryId }) {
+  const reasons = [];
+  if (!title) reasons.push("Missing title");
+  if (!brand) reasons.push("Missing brand");
+  if (!mpn) reasons.push("Missing MPN");
+  if (!price) reasons.push("Missing price");
+  if (!categoryId) reasons.push("Missing category");
+  return reasons;
 }
 
 function extractPartNumbers(text) {
@@ -542,22 +609,17 @@ function extractPartNumbers(text) {
   )].slice(0, 15);
 }
 
-function pickBestMpn(extracted, text) {
+function pickBestMpn(extracted) {
   const list = Array.isArray(extracted) ? extracted : [];
 
-  const hja = list.find((x) => /^HJA\d{4,}$/i.test(x));
-  if (hja) return hja;
-
-  const powerflex = list.find((x) => /^25[A-Z]-/i.test(x));
-  if (powerflex) return powerflex;
-
-  const ab = list.find((x) => /^(1756|1769|1734|2711|25B|22B|20F)/i.test(x));
-  if (ab) return ab;
-
-  const strong = list.find((x) => /[A-Z]/i.test(x) && /\d/.test(x) && x.length >= 6);
-  if (strong) return strong;
-
-  return list[0] || "";
+  return (
+    list.find((x) => /^HJA\d{4,}$/i.test(x)) ||
+    list.find((x) => /^25[A-Z]-/i.test(x)) ||
+    list.find((x) => /^(1756|1769|1734|2711|25B|22B|20F)/i.test(x)) ||
+    list.find((x) => /[A-Z]/i.test(x) && /\d/.test(x) && x.length >= 6) ||
+    list[0] ||
+    ""
+  );
 }
 
 function inferBrand(text) {
@@ -583,18 +645,14 @@ function inferBrand(text) {
 }
 
 function detectAmpRating(text) {
-  const t = String(text || "");
-  const match = t.match(/\b(\d{2,4})\s*A\b/i);
+  const match = String(text || "").match(/\b(\d{2,4})\s*A\b/i);
   return match ? `${match[1]}A` : "";
 }
 
 function detectType(text) {
   const t = String(text || "").toLowerCase();
 
-  if (t.includes("powerpact") || t.includes("circuit breaker") || t.includes("interrupting rating")) {
-    return "Circuit Breaker";
-  }
-
+  if (t.includes("powerpact") || t.includes("circuit breaker") || t.includes("interrupting rating")) return "Circuit Breaker";
   if (t.includes("powerflex") || t.includes("vfd") || t.includes("drive")) return "VFD Drive";
   if (t.includes("panelview") || t.includes("hmi")) return "HMI";
   if (t.includes("compactlogix") || t.includes("controllogix") || t.includes("plc")) return "PLC Module";
@@ -604,15 +662,30 @@ function detectType(text) {
   return "Industrial Automation Part";
 }
 
+function conditionToLabel(condition) {
+  const c = String(condition || "").toLowerCase();
+  if (c.includes("open")) return "New Open Box";
+  if (c.includes("new")) return "New";
+  if (c.includes("used")) return "Used";
+  if (c.includes("parts")) return "For Parts or Not Working";
+  return "New Open Box";
+}
+
+function mapConditionToEbay(condition) {
+  const c = String(condition || "").toLowerCase();
+  if (c.includes("open")) return "NEW_OTHER";
+  if (c.includes("new")) return "NEW";
+  if (c.includes("used")) return "USED_EXCELLENT";
+  if (c.includes("parts")) return "FOR_PARTS_OR_NOT_WORKING";
+  return "NEW_OTHER";
+}
+
 function normalizeItemSpecifics(input) {
   if (!input) return [];
 
   if (Array.isArray(input)) {
     return input
-      .map((x) => ({
-        name: String(x.name || x.Name || "").trim(),
-        value: String(x.value || x.Value || "").trim()
-      }))
+      .map((x) => ({ name: String(x.name || x.Name || "").trim(), value: String(x.value || x.Value || "").trim() }))
       .filter((x) => x.name && x.value);
   }
 
@@ -626,18 +699,12 @@ function normalizeItemSpecifics(input) {
 
 function convertAspects(aspectsArray = []) {
   const out = {};
-
   for (const a of aspectsArray) {
     const name = a.name || a.Name;
     const value = a.value || a.Value;
-
     if (!name || !value) continue;
-
-    out[String(name)] = Array.isArray(value)
-      ? value.map(String)
-      : [String(value)];
+    out[String(name)] = Array.isArray(value) ? value.map(String) : [String(value)];
   }
-
   return out;
 }
 
@@ -646,32 +713,17 @@ function buildHtmlDescription(draft) {
 
   return `
 <h2>${escapeHtml(draft.title || "Industrial Automation Part")}</h2>
-
 <p>Surplus industrial automation equipment. Please verify compatibility before purchase.</p>
-
 <ul>
 ${(draft.descriptionBullets || []).map((b) => `<li>${escapeHtml(b)}</li>`).join("\n")}
 </ul>
-
 <h3>Item Specifics</h3>
 <ul>
 ${specs.map((s) => `<li><strong>${escapeHtml(s.name)}:</strong> ${escapeHtml(s.value)}</li>`).join("\n")}
 </ul>
-
 <p><strong>Condition:</strong> ${escapeHtml(draft.condition || "New Open Box")}</p>
 <p>Ships from The Automation Engineer.</p>
 `.trim();
-}
-
-function mapConditionToEbay(condition) {
-  const c = String(condition || "").toLowerCase();
-
-  if (c.includes("open")) return "NEW_OTHER";
-  if (c.includes("new")) return "NEW";
-  if (c.includes("used")) return "USED_EXCELLENT";
-  if (c.includes("for parts")) return "FOR_PARTS_OR_NOT_WORKING";
-
-  return "NEW_OTHER";
 }
 
 function cleanTitle(title) {
@@ -720,7 +772,6 @@ async function saveDraft(env, draft) {
 async function safeJson(res) {
   const text = await res.text();
   if (!text) return null;
-
   try {
     return JSON.parse(text);
   } catch {
@@ -745,35 +796,7 @@ function json(data, status = 200) {
 function requireBinding(env, name) {
   if (!env[name]) throw new Error(`Missing Cloudflare binding: ${name}`);
 }
-function estimateFallbackPrice({ brand, mpn, rating, type, text }) {
-  const t = String(text || "").toLowerCase();
-  const r = Number(String(rating || "").replace(/\D/g, ""));
 
-  // Known strong industrial breaker example:
-  // Schneider / Square D PowerPact HJA36150 150A
-  if (
-    /hja36150/i.test(mpn || "") ||
-    (brand === "Schneider Electric" && t.includes("powerpact") && r === 150)
-  ) {
-    return 450;
-  }
-
-  if (type === "Circuit Breaker") {
-    if (r >= 400) return 750;
-    if (r >= 250) return 550;
-    if (r >= 150) return 425;
-    if (r >= 100) return 300;
-    return 175;
-  }
-
-  if (type === "VFD Drive") return 350;
-  if (type === "HMI") return 500;
-  if (type === "PLC Module") return 300;
-  if (type === "Sensor") return 75;
-  if (type === "Relay") return 60;
-
-  return 99;
-}
 function requireEbaySecrets(env) {
   for (const key of ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "EBAY_REFRESH_TOKEN"]) {
     if (!env[key]) throw new Error(`Missing secret: ${key}`);
