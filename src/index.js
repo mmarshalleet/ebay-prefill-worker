@@ -67,43 +67,79 @@ export default {
     }
   }
 };
-
- async function createDraft(request, env) {
+async function createDraft(request, env) {
   requireBinding(env, "DRAFT_KV");
 
   const contentType = request.headers.get("Content-Type") || "";
   let input = {};
+  let receivedFields = {};
 
   if (contentType.includes("multipart/form-data")) {
     const form = await request.formData();
 
+    receivedFields = {};
+    for (const [key, value] of form.entries()) {
+      receivedFields[key] = value instanceof File
+        ? `[file: ${value.name || "unnamed"}]`
+        : String(value).slice(0, 500);
+    }
+
+    const allText = [
+      form.get("ocrText"),
+      form.get("ocr"),
+      form.get("text"),
+      form.get("recognizedText"),
+      form.get("recognized_text"),
+      form.get("shortcutOCR"),
+      form.get("notes"),
+      form.get("description"),
+      form.get("title"),
+      form.get("itemTitle"),
+      form.get("name")
+    ].filter(Boolean).join("\n");
+
     input = {
-      title: form.get("title") || form.get("itemTitle") || "",
-      notes: form.get("notes") || "",
-      ocrText: form.get("ocrText") || form.get("ocr") || form.get("text") || "",
+      title: form.get("title") || form.get("itemTitle") || form.get("name") || "",
+      notes: form.get("notes") || form.get("description") || "",
+      ocrText: allText,
       condition: form.get("condition") || "New Open Box",
       quantity: Number(form.get("quantity") || 1),
       price: Number(form.get("price") || form.get("suggestedPrice") || 0),
       categoryId: form.get("categoryId") || "",
       brand: form.get("brand") || "",
-      mpn: form.get("mpn") || form.get("partNumber") || "",
+      mpn: form.get("mpn") || form.get("partNumber") || form.get("model") || "",
       imageUrls: parseJsonArray(form.get("imageUrls")),
       itemSpecifics: parseJsonObject(form.get("itemSpecifics"))
     };
   } else {
     const body = await request.json();
+    receivedFields = body;
+
+    const allText = [
+      body.ocrText,
+      body.ocr,
+      body.text,
+      body.recognizedText,
+      body.recognized_text,
+      body.shortcutOCR,
+      body.notes,
+      body.description,
+      body.title,
+      body.itemTitle,
+      body.name
+    ].filter(Boolean).join("\n");
 
     input = {
       ...body,
       title: body.title || body.itemTitle || body.name || "",
       notes: body.notes || body.description || "",
-      ocrText: body.ocrText || body.ocr || body.text || "",
+      ocrText: allText,
       condition: body.condition || "New Open Box",
       quantity: Number(body.quantity || 1),
       price: Number(body.price || body.suggestedPrice || 0),
       categoryId: body.categoryId || "",
       brand: body.brand || "",
-      mpn: body.mpn || body.partNumber || "",
+      mpn: body.mpn || body.partNumber || body.model || "",
       imageUrls: body.imageUrls || body.images || [],
       itemSpecifics: body.itemSpecifics || body.aspects || {}
     };
@@ -121,20 +157,28 @@ export default {
   const brand = input.brand || inferBrand(fullText);
   const mpn = input.mpn || extracted[0] || "";
 
+  const title = cleanTitle(
+    input.title ||
+    [brand, mpn, detectType(fullText)].filter(Boolean).join(" ") ||
+    "Review Needed - Unknown Industrial Part"
+  );
+
   const itemSpecifics = normalizeItemSpecifics({
     Brand: brand,
     MPN: mpn,
+    Model: mpn,
+    Type: detectType(fullText),
     ...(input.itemSpecifics || {})
   });
 
   const draft = {
     id: crypto.randomUUID(),
-    status: "draft",
+    status: mpn || brand ? "draft" : "needs_manual_review",
     publishEnabled: false,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
 
-    title: cleanTitle(input.title || buildTitle({ brand, mpn, text: fullText })),
+    title,
     brand,
     mpn,
     model: mpn,
@@ -146,7 +190,7 @@ export default {
 
     notes: input.notes,
     ocrText: input.ocrText,
-    ocrTextPreview: String(input.ocrText || "").slice(0, 500),
+    ocrTextPreview: String(input.ocrText || "").slice(0, 800),
     extractedPartNumbers: extracted,
 
     itemSpecifics,
@@ -155,11 +199,21 @@ export default {
     descriptionBullets: [
       brand ? `Brand: ${brand}` : "",
       mpn ? `MPN: ${mpn}` : "",
+      detectType(fullText) ? `Type: ${detectType(fullText)}` : "",
       `Condition: ${input.condition}`,
       input.notes ? `Notes: ${input.notes}` : ""
     ].filter(Boolean),
 
     imageUrls: Array.isArray(input.imageUrls) ? input.imageUrls.filter(Boolean) : [],
+
+    debug: {
+      contentType,
+      receivedFields,
+      fullTextPreview: fullText.slice(0, 1000),
+      extracted,
+      detectedBrand: brand,
+      detectedType: detectType(fullText)
+    },
 
     input
   };
@@ -167,7 +221,7 @@ export default {
   await saveDraft(env, draft);
   return json(draft, 201);
 }
-
+ 
 async function getDraft(url, env) {
   requireBinding(env, "DRAFT_KV");
 
