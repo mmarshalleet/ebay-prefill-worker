@@ -188,8 +188,9 @@ async function createDraft(request, env) {
     type,
     condition: input.condition,
     quantity: positiveInt(input.quantity, 1),
-    price: input.price || null,
-    suggestedPrice: input.price || null,
+    price: input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText }),
+    suggestedPrice: input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText }),
+    pricingConfidence: input.price ? "manual" : "fallback",
     categoryId: input.categoryId || "",
 
     notes: input.notes,
