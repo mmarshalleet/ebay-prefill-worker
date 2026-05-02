@@ -627,7 +627,17 @@ function parseJsonArray(value) {
     return [];
   }
 }
+function parseJsonObject(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
 
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 async function saveDraft(env, draft) {
   await env.DRAFT_KV.put(draft.id, JSON.stringify(draft), {
     expirationTtl: 60 * 60 * 24 * 30
