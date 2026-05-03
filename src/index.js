@@ -147,7 +147,64 @@ function estimatePrice({ type, rating }) {
 function clean(str) {
   return String(str || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
+function authStart(env) {
+  const scopes = [
+    "https://api.ebay.com/oauth/api_scope/sell.inventory",
+    "https://api.ebay.com/oauth/api_scope/sell.account"
+  ].join(" ");
 
+  const params = new URLSearchParams({
+    client_id: env.EBAY_CLIENT_ID,
+    redirect_uri: env.EBAY_RUNAME,
+    response_type: "code",
+    scope: scopes
+  });
+
+  return Response.redirect(
+    `https://auth.ebay.com/oauth2/authorize?${params.toString()}`,
+    302
+  );
+}
+
+async function authCallback(url, env) {
+  const code = url.searchParams.get("code");
+
+  if (!code) {
+    return json({
+      ok: false,
+      error: "missing_code",
+      query: Object.fromEntries(url.searchParams.entries())
+    }, 400);
+  }
+
+  const basic = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "authorization_code");
+  body.set("code", code);
+  body.set("redirect_uri", env.EBAY_RUNAME);
+
+  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const data = await res.json();
+
+  return json({
+    ok: res.ok,
+    status: res.status,
+    message: res.ok
+      ? "Copy refresh_token into Cloudflare as EBAY_REFRESH_TOKEN."
+      : "Token exchange failed.",
+    refresh_token: data.refresh_token || null,
+    raw: data
+  }, res.ok ? 200 : 400);
+}
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
