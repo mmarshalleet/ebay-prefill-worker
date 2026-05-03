@@ -1,837 +1,140 @@
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  "Access-Control-Allow-Headers": "Content-Type"
 };
-
-const JSON_HEADERS = {
-  "Content-Type": "application/json",
-  ...CORS_HEADERS
-};
-
-const EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token";
-const EBAY_INVENTORY_URL = "https://api.ebay.com/sell/inventory/v1";
-const EBAY_TAXONOMY_URL = "https://api.ebay.com/commerce/taxonomy/v1/category_tree/0";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    try {
-      const url = new URL(request.url);
+    const url = new URL(request.url);
 
-      if (request.method === "GET" && url.pathname === "/") {
-        return json({
-          ok: true,
-          service: "ebay-prefill-worker",
-          endpoints: ["POST /draft", "GET /draft?id=...", "POST /approve", "POST /publish", "POST /instant-list"]
-        });
-      }
+    if (url.pathname === "/draft" && request.method === "POST") {
+      const body = await request.json();
 
-      if (url.pathname === "/draft" && request.method === "POST") return await createDraft(request, env);
-      if (url.pathname === "/draft" && request.method === "GET") return await getDraft(url, env);
-      if (url.pathname === "/approve" && request.method === "POST") return await approveDraft(request, env);
-      if (url.pathname === "/publish" && request.method === "POST") return await publishDraft(request, env);
-      if (url.pathname === "/instant-list" && request.method === "POST") return await instantList(request, env);
+      const text = [
+        body.title,
+        body.notes,
+        body.ocrText
+      ].filter(Boolean).join(" ");
 
-      return json({ ok: false, error: "not_found" }, 404);
-    } catch (err) {
+      const manualMPN = body.mpn?.trim();
+      const manualBrand = body.brand?.trim();
+
+      const extracted = extractPartNumbers(text);
+
+      const mpn = manualMPN || extracted[0] || "";
+      const brand = manualBrand || inferBrand(text);
+
+      const rating = detectAmp(text);
+      const type = detectType(text);
+
+      const title = clean(
+        body.title ||
+        [brand, mpn, rating, type].filter(Boolean).join(" ")
+      );
+
+      const price = estimatePrice({ type, rating, mpn, brand });
+
+      const category = "Circuit Breakers";
+      const categoryId = "181841";
+
+      const ebayUrl = buildEbayUrl({
+        title,
+        price,
+        categoryId
+      });
+
       return json({
-        ok: false,
-        error: err.message || "Unexpected error",
-        details: err.details || null
-      }, err.status || 500);
+        title,
+        brand,
+        mpn,
+        rating,
+        type,
+        price,
+        category,
+        pricingConfidence: "fast-estimate",
+        instantEligible: true,
+        ebayUrl
+      });
     }
+
+    return json({ ok: false, error: "Not found" }, 404);
   }
 };
 
-async function createDraft(request, env) {
-  requireBinding(env, "DRAFT_KV");
-
-  const contentType = request.headers.get("Content-Type") || "";
-  let input = {};
-  let receivedFields = {};
-
-  if (contentType.includes("multipart/form-data")) {
-    const form = await request.formData();
-
-    for (const [key, value] of form.entries()) {
-      receivedFields[key] = value instanceof File ? `[file: ${value.name || "unnamed"}]` : String(value).slice(0, 1000);
-    }
-
-    const allText = [
-      form.get("ocrText"),
-      form.get("ocr"),
-      form.get("text"),
-      form.get("recognizedText"),
-      form.get("recognized_text"),
-      form.get("shortcutOCR"),
-      form.get("notes"),
-      form.get("description"),
-      form.get("title"),
-      form.get("itemTitle"),
-      form.get("name")
-    ].filter(Boolean).join("\n");
-
-    input = {
-      title: form.get("title") || form.get("itemTitle") || form.get("name") || "",
-      notes: form.get("notes") || form.get("description") || "",
-      ocrText: allText,
-      condition: form.get("condition") || "New Open Box",
-      quantity: Number(form.get("quantity") || 1),
-      price: Number(form.get("price") || form.get("suggestedPrice") || 0),
-      categoryId: form.get("categoryId") || "",
-      categoryName: form.get("categoryName") || "",
-      brand: form.get("brand") || "",
-      mpn: form.get("mpn") || form.get("partNumber") || form.get("model") || "",
-      imageUrls: parseJsonArray(form.get("imageUrls")),
-      itemSpecifics: parseJsonObject(form.get("itemSpecifics"))
-    };
-  } else {
-    const body = await request.json();
-    receivedFields = body;
-
-    const allText = [
-      body.ocrText,
-      body.ocr,
-      body.text,
-      body.recognizedText,
-      body.recognized_text,
-      body.shortcutOCR,
-      body.notes,
-      body.description,
-      body.title,
-      body.itemTitle,
-      body.name
-    ].filter(Boolean).join("\n");
-
-    input = {
-      ...body,
-      title: body.title || body.itemTitle || body.name || "",
-      notes: body.notes || body.description || "",
-      ocrText: allText,
-      condition: body.condition || "New Open Box",
-      quantity: Number(body.quantity || 1),
-      price: Number(body.price || body.suggestedPrice || 0),
-      categoryId: body.categoryId || "",
-      categoryName: body.categoryName || "",
-      brand: body.brand || "",
-      mpn: body.mpn || body.partNumber || body.model || "",
-      imageUrls: body.imageUrls || body.images || [],
-      itemSpecifics: body.itemSpecifics || body.aspects || {}
-    };
-  }
-
-  const fullText = [input.title, input.notes, input.ocrText, input.brand, input.mpn].filter(Boolean).join("\n");
-
-  const extracted = extractPartNumbers(fullText);
-  const brand = input.brand || inferBrand(fullText);
-  const mpn = input.mpn || pickBestMpn(extracted);
-  const rating = detectAmpRating(fullText);
-  const type = detectType(fullText);
-
-  const categoryGuess = guessCategory({ type, text: fullText });
-  const categoryId = input.categoryId || categoryGuess.categoryId;
-  const categoryName = input.categoryName || categoryGuess.categoryName;
-
-  const price = input.price || estimateFallbackPrice({ brand, mpn, rating, type, text: fullText });
-  const pricingConfidence = input.price ? "manual" : "fallback";
-
-  const title = cleanTitle(
-    input.title ||
-    [brand, mpn, rating, type].filter(Boolean).join(" ") ||
-    "Review Needed - Unknown Industrial Part"
-  );
-
-  const itemSpecifics = normalizeItemSpecifics({
-    Brand: brand,
-    MPN: mpn,
-    Model: mpn,
-    Amperage: rating,
-    Type: type,
-    ...(input.itemSpecifics || {})
-  });
-
-  const instantEligible = Boolean(
-    title &&
-    conditionToLabel(input.condition) &&
-    price &&
-    categoryId &&
-    mpn &&
-    brand
-  );
-
-  const draft = {
-    id: crypto.randomUUID(),
-    status: mpn || brand ? "draft" : "needs_manual_review",
-    publishEnabled: false,
-    instantEligible,
-    autoPublishEligibility: {
-      eligible: instantEligible,
-      reasons: instantEligible ? [] : buildEligibilityReasons({ title, brand, mpn, price, categoryId })
-    },
-
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-
+function buildEbayUrl({ title, price, categoryId }) {
+  const params = new URLSearchParams({
     title,
-    brand,
-    mpn,
-    model: mpn,
-    rating,
-    type,
-    condition: conditionToLabel(input.condition),
-    quantity: positiveInt(input.quantity, 1),
-
     price,
-    suggestedPrice: price,
-    pricingConfidence,
-    pricingReason: pricingConfidence === "manual" ? "Manual price provided." : "Fallback estimate based on detected item type/rating.",
-
-    categoryId,
-    categoryName,
-    category: categoryName,
-
-    notes: input.notes,
-    ocrText: input.ocrText,
-    ocrTextPreview: String(input.ocrText || "").slice(0, 1000),
-    extractedPartNumbers: extracted,
-
-    itemSpecifics,
-    ebayAspects: convertAspects(itemSpecifics),
-
-    descriptionBullets: [
-      brand ? `Brand: ${brand}` : "",
-      mpn ? `MPN: ${mpn}` : "",
-      rating ? `Rating: ${rating}` : "",
-      type ? `Type: ${type}` : "",
-      categoryName ? `Category: ${categoryName}` : "",
-      `Condition: ${conditionToLabel(input.condition)}`,
-      input.notes ? `Notes: ${input.notes}` : ""
-    ].filter(Boolean),
-
-    imageUrls: Array.isArray(input.imageUrls) ? input.imageUrls.filter(Boolean) : [],
-
-    debug: {
-      contentType,
-      receivedFields,
-      fullTextPreview: fullText.slice(0, 1500),
-      extracted,
-      detectedBrand: brand,
-      detectedMpn: mpn,
-      detectedRating: rating,
-      detectedType: type,
-      categoryGuess
-    },
-
-    input
-  };
-
-  await saveDraft(env, draft);
-  return json(draft, 201);
-}
-
-async function getDraft(url, env) {
-  requireBinding(env, "DRAFT_KV");
-
-  const id = url.searchParams.get("id");
-  if (!id) return json({ ok: false, error: "missing_id" }, 400);
-
-  const draft = await env.DRAFT_KV.get(id, { type: "json" });
-  if (!draft) return json({ ok: false, error: "draft_not_found" }, 404);
-
-  return json(draft);
-}
-
-async function approveDraft(request, env) {
-  requireBinding(env, "DRAFT_KV");
-  requireEbaySecrets(env);
-
-  const body = await request.json();
-  const draftId = String(body.draftId || "").trim();
-
-  if (!draftId) return json({ ok: false, error: "missing_draft_id" }, 400);
-
-  let draft = await env.DRAFT_KV.get(draftId, { type: "json" });
-  if (!draft) return json({ ok: false, error: "draft_not_found" }, 404);
-
-  draft = applyOverrides(draft, body);
-
-  if (!draft.categoryId) {
-    draft.categoryId = await suggestCategoryId(draft, env);
-  }
-
-  if (!draft.categoryId) {
-    draft.status = "category_required";
-    draft.updatedAt = new Date().toISOString();
-    await saveDraft(env, draft);
-
-    return json({
-      ok: false,
-      error: "category_required",
-      message: "Add categoryId and approve again.",
-      draft
-    }, 422);
-  }
-
-  const offerDraft = await createEbayOfferDraftOnly(draft, env);
-  await saveDraft(env, offerDraft);
-
-  return json(offerDraft);
-}
-
-async function publishDraft(request, env) {
-  requireBinding(env, "DRAFT_KV");
-  requireEbaySecrets(env);
-
-  const body = await request.json();
-  const draftId = String(body.draftId || "").trim();
-
-  if (!draftId) return json({ ok: false, error: "missing_draft_id" }, 400);
-
-  let draft = await env.DRAFT_KV.get(draftId, { type: "json" });
-  if (!draft) return json({ ok: false, error: "draft_not_found" }, 404);
-
-  if (!draft.ebayOffer?.offerId) draft = await createEbayOfferDraftOnly(draft, env);
-
-  const published = await publishExistingEbayOffer(draft, env);
-  await saveDraft(env, published);
-
-  return json(published);
-}
-
-async function instantList(request, env) {
-  requireBinding(env, "DRAFT_KV");
-  requireEbaySecrets(env);
-
-  const body = await request.json();
-  const draftId = String(body.draftId || "").trim();
-
-  if (!draftId) return json({ ok: false, error: "missing_draft_id" }, 400);
-
-  let draft = await env.DRAFT_KV.get(draftId, { type: "json" });
-  if (!draft) return json({ ok: false, error: "draft_not_found" }, 404);
-
-  draft = applyOverrides(draft, body);
-
-  if (!draft.categoryId) draft.categoryId = await suggestCategoryId(draft, env);
-
-  draft = await createEbayOfferDraftOnly(draft, env);
-  draft = await publishExistingEbayOffer(draft, env);
-
-  await saveDraft(env, draft);
-  return json(draft);
-}
-
-async function getEbayToken(env) {
-  if (env.EBAY_USER_TOKEN) return env.EBAY_USER_TOKEN;
-
-  const basic = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
-
-  const body = new URLSearchParams();
-  body.set("grant_type", "refresh_token");
-  body.set("refresh_token", env.EBAY_REFRESH_TOKEN);
-  body.set("scope", [
-    "https://api.ebay.com/oauth/api_scope/sell.inventory",
-    "https://api.ebay.com/oauth/api_scope/sell.account"
-  ].join(" "));
-
-  const res = await fetch(EBAY_OAUTH_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body
+    category: categoryId,
+    format: "BIN",
+    condition: "1000"
   });
 
-  const data = await safeJson(res);
-  if (!res.ok) throw apiError("eBay OAuth failed", res.status, data);
-
-  return data.access_token;
+  return `https://www.ebay.com/sl/sell?${params.toString()}`;
 }
 
-  const price = Number(draft.price || draft.suggestedPrice || 0);
-  if (!price || price <= 0) {
-    return {
-      ...draft,
-      status: "price_required",
-      publishEnabled: false,
-      ebayOfferWarnings: ["Price is required before creating an eBay offer."],
-      updatedAt: new Date().toISOString()
-    };
-  }
+function extractPartNumbers(text) {
+  const t = text.toUpperCase();
 
-  if (!draft.categoryId) {
-    return {
-      ...draft,
-      status: "category_required",
-      publishEnabled: false,
-      ebayOfferWarnings: ["categoryId is required before creating an eBay offer."],
-      updatedAt: new Date().toISOString()
-    };
-  }
+  const matches = [
+    ...(t.match(/\b[A-Z]{2,}\d{4,}\b/g) || []),
+    ...(t.match(/\b[A-Z0-9]+-[A-Z0-9-]+\b/g) || [])
+  ];
 
-  await ebayFetch(token, `/inventory_item/${encodeURIComponent(sku)}`, "PUT", {
-    condition: mapConditionToEbay(draft.condition),
-    availability: {
-      shipToLocationAvailability: {
-        quantity: positiveInt(draft.quantity || draft.input?.quantity, 1)
-      }
-    },
-    product: {
-      title: cleanTitle(draft.title),
-      description: buildHtmlDescription(draft),
-      imageUrls: draft.imageUrls || [],
-      aspects: convertAspects(draft.itemSpecifics || draft.ebayAspects || [])
-    }
-  });
-
-  const offerPayload = {
-    sku,
-    marketplaceId: env.EBAY_MARKETPLACE_ID || "EBAY_US",
-    format: "FIXED_PRICE",
-    availableQuantity: positiveInt(draft.quantity || draft.input?.quantity, 1),
-    categoryId: String(draft.categoryId),
-    listingDescription: buildHtmlDescription(draft),
-    listingDuration: "GTC",
-    includeCatalogProductDetails: false,
-    pricingSummary: {
-      price: {
-        value: price.toFixed(2),
-        currency: env.EBAY_CURRENCY || "USD"
-      }
-    }
-  };
-
-  if (env.EBAY_LOCATION_KEY) offerPayload.merchantLocationKey = env.EBAY_LOCATION_KEY;
-
-  if (env.EBAY_PAYMENT_POLICY_ID && env.EBAY_RETURN_POLICY_ID && env.EBAY_FULFILLMENT_POLICY_ID) {
-    offerPayload.listingPolicies = {
-      paymentPolicyId: env.EBAY_PAYMENT_POLICY_ID,
-      returnPolicyId: env.EBAY_RETURN_POLICY_ID,
-      fulfillmentPolicyId: env.EBAY_FULFILLMENT_POLICY_ID
-    };
-  }
-
-  const offer = await ebayFetch(token, "/offer", "POST", offerPayload);
-
-  return {
-    ...draft,
-    sku,
-    status: "ready_to_publish_later",
-    publishEnabled: true,
-    instantEligible: true,
-    ebayOffer: {
-      offerId: offer.offerId,
-      sku,
-      createdAt: new Date().toISOString()
-    },
-    ebayOfferWarnings: [],
-    updatedAt: new Date().toISOString()
-  };
+  return [...new Set(matches)];
 }
 
-async function publishExistingEbayOffer(draft, env) {
-  const token = await getEbayToken(env);
-  const offerId = draft.ebayOffer?.offerId;
+function inferBrand(text) {
+  const t = text.toLowerCase();
 
-  if (!offerId) throw new Error("Missing offerId. Approve the draft first.");
+  if (t.includes("schneider") || t.includes("powerpact")) return "Schneider Electric";
+  if (t.includes("ifm")) return "IFM";
+  if (t.includes("allen-bradley")) return "Allen-Bradley";
 
-  const result = await ebayFetch(token, `/offer/${offerId}/publish`, "POST", null);
-
-  return {
-    ...draft,
-    status: "published",
-    publishEnabled: false,
-    ebayListing: {
-      listingId: result.listingId || result.listing?.listingId || null,
-      publishedAt: new Date().toISOString(),
-      raw: result
-    },
-    updatedAt: new Date().toISOString()
-  };
+  return "";
 }
 
-async function getEbayToken(env) {
-  const basic = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
-
-  const body = new URLSearchParams();
-  body.set("grant_type", "refresh_token");
-  body.set("refresh_token", env.EBAY_REFRESH_TOKEN);
-  body.set("scope", [
-    "https://api.ebay.com/oauth/api_scope/sell.inventory",
-    "https://api.ebay.com/oauth/api_scope/sell.account",
-    "https://api.ebay.com/oauth/api_scope/buy.browse"
-  ].join(" "));
-
-  const res = await fetch(EBAY_OAUTH_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body
-  });
-
-  const data = await safeJson(res);
-  if (!res.ok) throw apiError("eBay OAuth failed", res.status, data);
-
-  return data.access_token;
+function detectAmp(text) {
+  const match = text.match(/(\d{2,4})\s*A/i);
+  return match ? `${match[1]}A` : "";
 }
 
-async function ebayFetch(token, path, method, payload) {
-  const res = await fetch(`${EBAY_INVENTORY_URL}${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "Content-Language": "en-US",
-      Accept: "application/json"
-    },
-    body: payload ? JSON.stringify(payload) : undefined
-  });
+function detectType(text) {
+  const t = text.toLowerCase();
 
-  const data = await safeJson(res);
-  if (!res.ok) throw apiError(`eBay Inventory API failed: ${method} ${path}`, res.status, data);
+  if (t.includes("breaker") || t.includes("powerpact")) return "Circuit Breaker";
+  if (t.includes("sensor")) return "Sensor";
 
-  return data || {};
+  return "Industrial Part";
 }
 
-async function suggestCategoryId(draft, env) {
-  try {
-    const token = await getEbayToken(env);
-    const query = encodeURIComponent([draft.brand, draft.mpn, draft.title].filter(Boolean).join(" "));
-
-    const res = await fetch(`${EBAY_TAXONOMY_URL}/get_category_suggestions?q=${query}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json"
-      }
-    });
-
-    const data = await safeJson(res);
-    return data?.categorySuggestions?.[0]?.category?.categoryId || "";
-  } catch {
-    return "";
-  }
-}
-
-function applyOverrides(draft, body) {
-  const updated = { ...draft };
-
-  if (body.title) updated.title = cleanTitle(body.title);
-  if (body.price) updated.price = Number(body.price);
-  if (body.suggestedPrice) updated.suggestedPrice = Number(body.suggestedPrice);
-  if (body.categoryId) updated.categoryId = String(body.categoryId).trim();
-  if (body.categoryName) {
-    updated.categoryName = String(body.categoryName).trim();
-    updated.category = updated.categoryName;
-  }
-  if (body.condition) updated.condition = conditionToLabel(body.condition);
-  if (body.quantity) updated.quantity = positiveInt(body.quantity, 1);
-  if (body.brand) updated.brand = body.brand;
-  if (body.mpn) updated.mpn = body.mpn;
-  if (Array.isArray(body.imageUrls)) updated.imageUrls = body.imageUrls.filter(Boolean);
-  if (body.itemSpecifics) updated.itemSpecifics = normalizeItemSpecifics(body.itemSpecifics);
-
-  updated.instantEligible = Boolean(updated.title && updated.condition && updated.price && updated.categoryId && updated.mpn && updated.brand);
-  updated.updatedAt = new Date().toISOString();
-
-  return updated;
-}
-
-function guessCategory({ type, text }) {
-  const t = String(text || "").toLowerCase();
-
-  if (type === "Circuit Breaker" || t.includes("breaker") || t.includes("powerpact")) {
-    return {
-      categoryId: "181841",
-      categoryName: "Circuit Breakers"
-    };
-  }
-
-  if (type === "VFD Drive") {
-    return {
-      categoryId: "78191",
-      categoryName: "Variable Frequency Drives"
-    };
-  }
-
-  if (type === "HMI") {
-    return {
-      categoryId: "181735",
-      categoryName: "Operator Interface Panels"
-    };
-  }
-
-  if (type === "PLC Module") {
-    return {
-      categoryId: "181730",
-      categoryName: "PLC Processors"
-    };
-  }
-
-  return {
-    categoryId: "",
-    categoryName: ""
-  };
-}
-
-function estimateFallbackPrice({ brand, mpn, rating, type, text }) {
-  const t = String(text || "").toLowerCase();
-  const r = Number(String(rating || "").replace(/\D/g, ""));
-
-  if (/hja36150/i.test(mpn || "") || (brand === "Schneider Electric" && t.includes("powerpact") && r === 150)) return 450;
+function estimatePrice({ type, rating }) {
+  const r = Number((rating || "").replace(/\D/g, ""));
 
   if (type === "Circuit Breaker") {
-    if (r >= 400) return 750;
-    if (r >= 250) return 550;
     if (r >= 150) return 450;
     if (r >= 100) return 300;
     return 175;
   }
 
-  if (type === "VFD Drive") return 350;
-  if (type === "HMI") return 500;
-  if (type === "PLC Module") return 300;
-  if (type === "Sensor") return 75;
-  if (type === "Relay") return 60;
-
   return 99;
 }
 
-function buildEligibilityReasons({ title, brand, mpn, price, categoryId }) {
-  const reasons = [];
-  if (!title) reasons.push("Missing title");
-  if (!brand) reasons.push("Missing brand");
-  if (!mpn) reasons.push("Missing MPN");
-  if (!price) reasons.push("Missing price");
-  if (!categoryId) reasons.push("Missing category");
-  return reasons;
-}
-
-function extractPartNumbers(text) {
-  const t = String(text || "").toUpperCase();
-
-  const matches = [
-    ...(t.match(/\b[A-Z0-9]{2,}[-./][A-Z0-9][A-Z0-9\-./]*\b/g) || []),
-    ...(t.match(/\b[A-Z]{2,}\d{3,}\b/g) || []),
-    ...(t.match(/\b[A-Z]{2,}\s+\d{2,4}\b/g) || []),
-    ...(t.match(/\b\d{4,}[A-Z]{1,}\b/g) || []),
-    ...(t.match(/\b[A-Z]{1,}\d{2,}[A-Z]{1,}\b/g) || [])
-  ];
-
-  return [...new Set(
-    matches
-      .map((x) => x.replace(/\s+/g, "").replace(/[.,;:]$/, "").trim())
-      .filter((x) => x.length >= 4)
-      .filter((x) => !/^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$/.test(x))
-      .filter((x) => !["50160HZ", "609472"].includes(x))
-  )].slice(0, 15);
-}
-
-function pickBestMpn(extracted) {
-  const list = Array.isArray(extracted) ? extracted : [];
-
-  return (
-    list.find((x) => /^HJA\d{4,}$/i.test(x)) ||
-    list.find((x) => /^25[A-Z]-/i.test(x)) ||
-    list.find((x) => /^(1756|1769|1734|2711|25B|22B|20F)/i.test(x)) ||
-    list.find((x) => /[A-Z]/i.test(x) && /\d/.test(x) && x.length >= 6) ||
-    list[0] ||
-    ""
-  );
-}
-
-function inferBrand(text) {
-  const t = String(text || "").toLowerCase();
-
-  if (t.includes("schneider")) return "Schneider Electric";
-  if (t.includes("powerpact")) return "Schneider Electric";
-  if (t.includes("square d")) return "Square D";
-  if (t.includes("allen-bradley") || t.includes("rockwell")) return "Allen-Bradley";
-  if (t.includes("siemens")) return "Siemens";
-  if (t.includes("keyence")) return "Keyence";
-  if (t.includes("omron")) return "Omron";
-  if (t.includes("banner")) return "Banner";
-  if (t.includes("schmersal")) return "Schmersal";
-  if (t.includes("danfoss")) return "Danfoss";
-  if (t.includes("lenze")) return "Lenze";
-  if (t.includes("phoenix")) return "Phoenix Contact";
-  if (t.includes("marel")) return "Marel";
-  if (t.includes("ishida")) return "Ishida";
-  if (t.includes("secomea")) return "Secomea";
-
-  return "";
-}
-
-function detectAmpRating(text) {
-  const match = String(text || "").match(/\b(\d{2,4})\s*A\b/i);
-  return match ? `${match[1]}A` : "";
-}
-
-function detectType(text) {
-  const t = String(text || "").toLowerCase();
-
-  if (t.includes("powerpact") || t.includes("circuit breaker") || t.includes("interrupting rating")) return "Circuit Breaker";
-  if (t.includes("powerflex") || t.includes("vfd") || t.includes("drive")) return "VFD Drive";
-  if (t.includes("panelview") || t.includes("hmi")) return "HMI";
-  if (t.includes("compactlogix") || t.includes("controllogix") || t.includes("plc")) return "PLC Module";
-  if (t.includes("sensor")) return "Sensor";
-  if (t.includes("relay")) return "Relay";
-
-  return "Industrial Automation Part";
-}
-
-function conditionToLabel(condition) {
-  const c = String(condition || "").toLowerCase();
-  if (c.includes("open")) return "New Open Box";
-  if (c.includes("new")) return "New";
-  if (c.includes("used")) return "Used";
-  if (c.includes("parts")) return "For Parts or Not Working";
-  return "New Open Box";
-}
-
-function mapConditionToEbay(condition) {
-  const c = String(condition || "").toLowerCase();
-  if (c.includes("open")) return "NEW_OTHER";
-  if (c.includes("new")) return "NEW";
-  if (c.includes("used")) return "USED_EXCELLENT";
-  if (c.includes("parts")) return "FOR_PARTS_OR_NOT_WORKING";
-  return "NEW_OTHER";
-}
-
-function normalizeItemSpecifics(input) {
-  if (!input) return [];
-
-  if (Array.isArray(input)) {
-    return input
-      .map((x) => ({ name: String(x.name || x.Name || "").trim(), value: String(x.value || x.Value || "").trim() }))
-      .filter((x) => x.name && x.value);
-  }
-
-  return Object.entries(input)
-    .map(([name, value]) => ({
-      name: String(name).trim(),
-      value: Array.isArray(value) ? value.join(", ") : String(value || "").trim()
-    }))
-    .filter((x) => x.name && x.value);
-}
-
-function convertAspects(aspectsArray = []) {
-  const out = {};
-  for (const a of aspectsArray) {
-    const name = a.name || a.Name;
-    const value = a.value || a.Value;
-    if (!name || !value) continue;
-    out[String(name)] = Array.isArray(value) ? value.map(String) : [String(value)];
-  }
-  return out;
-}
-
-function buildHtmlDescription(draft) {
-  const specs = normalizeItemSpecifics(draft.itemSpecifics || []);
-
-  return `
-<h2>${escapeHtml(draft.title || "Industrial Automation Part")}</h2>
-<p>Surplus industrial automation equipment. Please verify compatibility before purchase.</p>
-<ul>
-${(draft.descriptionBullets || []).map((b) => `<li>${escapeHtml(b)}</li>`).join("\n")}
-</ul>
-<h3>Item Specifics</h3>
-<ul>
-${specs.map((s) => `<li><strong>${escapeHtml(s.name)}:</strong> ${escapeHtml(s.value)}</li>`).join("\n")}
-</ul>
-<p><strong>Condition:</strong> ${escapeHtml(draft.condition || "New Open Box")}</p>
-<p>Ships from The Automation Engineer.</p>
-`.trim();
-}
-
-function cleanTitle(title) {
-  return String(title || "")
-    .replace(/\s+/g, " ")
-    .replace(/[^\x20-\x7E®]/g, "")
-    .trim()
-    .slice(0, 80);
-}
-
-function positiveInt(value, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
-}
-
-function parseJsonArray(value) {
-  if (!value) return [];
-  if (Array.isArray(value)) return value;
-
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseJsonObject(value) {
-  if (!value) return {};
-  if (typeof value === "object") return value;
-
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-async function saveDraft(env, draft) {
-  await env.DRAFT_KV.put(draft.id, JSON.stringify(draft), {
-    expirationTtl: 60 * 60 * 24 * 30
-  });
-}
-
-async function safeJson(res) {
-  const text = await res.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw: text };
-  }
-}
-
-function apiError(message, status, details) {
-  const err = new Error(message);
-  err.status = status;
-  err.details = details;
-  return err;
+function clean(str) {
+  return String(str || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: JSON_HEADERS
+    headers: {
+      "Content-Type": "application/json",
+      ...CORS_HEADERS
+    }
   });
-}
-
-function requireBinding(env, name) {
-  if (!env[name]) throw new Error(`Missing Cloudflare binding: ${name}`);
-}
-
-function requireEbaySecrets(env) {
-  for (const key of ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "EBAY_REFRESH_TOKEN"]) {
-    if (!env[key]) throw new Error(`Missing secret: ${key}`);
-  }
-}
-
-function escapeHtml(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
