@@ -161,10 +161,12 @@ function authStart(env) {
     }, 500);
   }
 
-  const scopes = [
-    "https://api.ebay.com/oauth/api_scope/sell.inventory",
-    "https://api.ebay.com/oauth/api_scope/sell.account"
-  ].join(" ");
+ const scopes = [
+  "https://api.ebay.com/oauth/api_scope",
+  "https://api.ebay.com/oauth/api_scope/sell.inventory",
+  "https://api.ebay.com/oauth/api_scope/sell.account",
+  "https://api.ebay.com/oauth/api_scope/sell.fulfillment"
+].join(" ");
 
   const params = new URLSearchParams();
   params.set("client_id", env.EBAY_CLIENT_ID);
