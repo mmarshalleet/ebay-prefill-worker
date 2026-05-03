@@ -11,6 +11,25 @@ export default {
     }
 
     const url = new URL(request.url);
+    if (url.pathname === "/") {
+  return json({
+    ok: true,
+    service: "ebay-prefill-worker",
+    routes: ["/draft", "/auth/start", "/auth/callback", "/auth/declined"]
+  });
+}
+
+if (url.pathname === "/auth/start") {
+  return authStart(env);
+}
+
+if (url.pathname === "/auth/callback") {
+  return authCallback(url, env);
+}
+
+if (url.pathname === "/auth/declined") {
+  return json({ ok: false, error: "authorization_declined" });
+}
 
     if (url.pathname === "/draft" && request.method === "POST") {
       const body = await request.json();
