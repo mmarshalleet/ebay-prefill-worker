@@ -148,24 +148,39 @@ function clean(str) {
   return String(str || "").replace(/\s+/g, " ").trim().slice(0, 80);
 }
 function authStart(env) {
+  const missing = [];
+
+  if (!env.EBAY_CLIENT_ID) missing.push("EBAY_CLIENT_ID");
+  if (!env.EBAY_RUNAME) missing.push("EBAY_RUNAME");
+
+  if (missing.length) {
+    return json({
+      ok: false,
+      error: "missing_env_vars",
+      missing
+    }, 500);
+  }
+
   const scopes = [
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account"
   ].join(" ");
 
-  const params = new URLSearchParams({
-    client_id: env.EBAY_CLIENT_ID,
-    redirect_uri: env.EBAY_RUNAME,
-    response_type: "code",
-    scope: scopes
+  const params = new URLSearchParams();
+  params.set("client_id", env.EBAY_CLIENT_ID);
+  params.set("redirect_uri", env.EBAY_RUNAME);
+  params.set("response_type", "code");
+  params.set("scope", scopes);
+
+  const authUrl = `https://auth.ebay.com/oauth2/authorize?${params.toString()}`;
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: authUrl
+    }
   });
-
-  return Response.redirect(
-    `https://auth.ebay.com/oauth2/authorize?${params.toString()}`,
-    302
-  );
 }
-
 async function authCallback(url, env) {
   const code = url.searchParams.get("code");
 
